@@ -659,8 +659,9 @@ jobs:
       - name: Check Device.DEFAULT and print some source
         env:
           DEBUG: 5
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m pytest test/test_ops.py -k 'test_add'
+          python3 test/test_ops.py TestOps.test_add
       - name: Run pytest
         run: |
           python -m pytest -n=auto test/test_tiny.py --durations=20
