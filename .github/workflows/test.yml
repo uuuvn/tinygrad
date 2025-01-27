@@ -660,7 +660,7 @@ jobs:
         env:
           DEBUG: 5
         run: |
-          python -m pytest test/test_ops.py TestOps.test_add
+          python -m pytest test/test_ops.py -k 'test_add'
       - name: Run pytest
         run: |
           python -m pytest -n=auto test/test_tiny.py --durations=20
