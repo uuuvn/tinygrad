@@ -657,8 +657,10 @@ jobs:
       - name: Install dependencies
         run: pip install --user -e '.[testing]' --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Check Device.DEFAULT and print some source
+        env:
+          DEBUG: 5
         run: |
-          DEBUG=5 python -m pytest test/test_ops.py TestOps.test_add
+          python -m pytest test/test_ops.py TestOps.test_add
       - name: Run pytest
         run: |
           python -m pytest -n=auto test/test_tiny.py --durations=20
