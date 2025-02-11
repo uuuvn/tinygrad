@@ -57,13 +57,15 @@ class CompiledRunner(Runner):
       local_size = optimize_local_size(self._prg, global_size, rawbufs)
       global_size = [g//l if g%l == 0 else g/l for g,l in zip(global_size, local_size)]
       self.p = replace(self.p, global_size=global_size, local_size=local_size)
-    lra = {}
+    lra: dict = {}
     if global_size:
       lra['global_size'] = tuple(global_size)
       assert len(global_size) == 3, "global size must have len 3"
     if local_size:
       lra['local_size'] = tuple(local_size)
       assert len(local_size) == 3, "local size must have len 3"
+    if self.p.num_threads is not None:
+      lra['num_threads'] = self.p.num_threads
     return self._prg(*[x._buf for x in rawbufs], **lra, vals=tuple(var_vals[k] for k in self.p.vars), wait=wait)
 
 class ViewOp(Runner):

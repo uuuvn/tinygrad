@@ -69,7 +69,9 @@ def get_index(ast:UOp, opts:Renderer) -> IndexContext:
              get_grouped_dims("lidx", full_shape[global_dims:first_reduce+group_for_reduces], opts.local_max)
   else:
     # all loops are RANGES
-    idxs = [UOp(Ops.RANGE, dtypes.int, (sint_to_uop(0), sint_to_uop(g)), i) for i,g in enumerate(full_shape[:first_reduce])]
+    if ki.threads is not None: assert full_shape[0] == ki.threads
+    idxs = [UOp(Ops.SPECIAL, dtypes.int, arg=('tid', ki.threads))] if ki.threads is not None else []
+    idxs.extend([UOp(Ops.RANGE, dtypes.int, (sint_to_uop(0), sint_to_uop(g)), i) for i,g in enumerate(full_shape[len(idxs):first_reduce])])
 
   # reduce loops
   idxs += [UOp(Ops.RANGE, dtypes.int, (sint_to_uop(0), sint_to_uop(g)), i)

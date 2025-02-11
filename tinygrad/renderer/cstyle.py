@@ -77,7 +77,7 @@ class CStyleLanguage(Renderer):
   smem_prefix_for_cast: bool = True
   arg_int_prefix: str = "const int"
   barrier: str = ""
-  code_for_workitem: dict[Union[Literal["g"], Literal["l"], Literal["i"]], Callable] = {}
+  code_for_workitem: dict[Union[Literal["g"], Literal["l"], Literal["i"], Literal["t"]], Callable] = {}
   extra_args: list[str] = []
   float4: Optional[str] = None
   type_map: dict[DType, str] = {}
@@ -180,6 +180,8 @@ class ClangRenderer(CStyleLanguage):
   # LLVM legalizes double => half cast on systems that don't support it natively (like x86 cpus without AVX512-FP16) into a compiler-rt libcall.
   extra_matcher = PatternMatcher([(UPat.var("x", dtypes.float64).cast(dtypes.float16), lambda x: x.cast(dtypes.float32).cast(dtypes.float16))]) + \
     CStyleLanguage.extra_matcher
+  extra_args = ['int thread_id']
+  code_for_workitem = {'t': lambda x: 'thread_id'}
 
   if AMX:
     tensor_cores = [TensorCore(dims=(sz,sz,1), threads=1, elements_per_thread=(sz,sz,sz*sz), dtype_in=dt, dtype_out=dt,

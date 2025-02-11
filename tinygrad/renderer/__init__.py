@@ -80,6 +80,7 @@ class ProgramSpec:
   globals:list[int]=field(default_factory=list)
   outs:list[int]=field(default_factory=list)
   ins:list[int]=field(default_factory=list)
+  num_threads:int|None = None
   _ran_post_init:bool=False  # NOTE: this is needed if you call replace on the Program
 
   def __post_init__(self):
@@ -92,6 +93,7 @@ class ProgramSpec:
         if u.op is Ops.LOAD: self.ins.extend([x.arg for x in u.src[0].toposort if x.op is Ops.DEFINE_GLOBAL])
         if u.op is Ops.SPECIAL:
           # NOTE: you have to set local_size and global_size to the base [1,1,1] outside this
+          if u.arg[0][0] == 't': continue
           if u.arg[0][0] == 'i': self.local_size = None
           special_size = self.local_size if u.arg[0][0] == 'l' else self.global_size
           assert special_size is not None

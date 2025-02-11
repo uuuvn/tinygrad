@@ -1,10 +1,10 @@
 from typing import cast, Optional, Callable
-import itertools, functools, random, math, time, multiprocessing, traceback, signal, atexit
+import itertools, functools, random, math, time, multiprocessing, traceback, ctypes, signal, atexit
 from collections import defaultdict
 from dataclasses import replace
 from tinygrad.ops import UOp, Ops, Variable, sym_infer
-from tinygrad.device import Device, Buffer, Compiler
-from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, Context, colored, to_function_name
+from tinygrad.device import Device, Buffer, Compiler, CPUProgram
+from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, Context, colored, to_function_name, mv_address
 from tinygrad.helpers import IGNORE_BEAM_CACHE, TC_SEARCH_OVER_SHAPE
 from tinygrad.dtype import ImageDType, PtrDType
 from tinygrad.codegen.kernel import Kernel, Opt, OptOps, KernelOptError
@@ -15,6 +15,11 @@ from tinygrad.renderer import ProgramSpec
 actions = [Opt(op=OptOps.UPCAST, axis=axis, arg=amt) for amt in [0,2,3,4,5,7] for axis in range(6)]
 actions += [Opt(op=OptOps.UNROLL, axis=axis, arg=amt) for amt in [0,4,7] for axis in range(5)]
 actions += [Opt(op=OptOps.LOCAL, axis=axis, arg=amt) for amt in [2,3,4,8,13,16,29] for axis in range(6)]
+# NOTE: just making beam be able to choose ridiculous things like 128 threads on 10 core cpu makes it sometimes choose them and end up with less perf.
+# This is not great and is probably a bug somwhere that when fixed will give more perf to other stuff as well because of more sane search
+# This is probably also related to a couple discord message i saw that were claiming that higher beam depth regresses perf
+# actions += [Opt(op=OptOps.THREAD, axis=axis, arg=amt) for amt in range(2, multiprocessing.cpu_count()*16+1) for axis in range(6)]
+actions += [Opt(op=OptOps.THREAD, axis=axis, arg=2**int(math.log2(multiprocessing.cpu_count()))) for axis in range(6)]
 actions += [Opt(op=OptOps.GROUPTOP, axis=axis, arg=amt) for amt in [13,16,28,29,32,49,64,256] for axis in range(3)]
 actions += [Opt(op=OptOps.GROUP, axis=axis, arg=amt) for amt in [0,4,8,16] for axis in range(3)]
 if getenv("BEAM_PADTO", 1): actions += [Opt(op=OptOps.PADTO, axis=axis, arg=amt) for amt in [32] for axis in range(7)]
@@ -49,6 +54,10 @@ def _time_program(p:ProgramSpec, lib:bytes, var_vals:dict[Variable, int], rawbuf
       if hasattr(dev:=Device[p.device], 'invalidate_caches'): dev.invalidate_caches()
       else:
         with Context(DEBUG=0, BEAM=0, CAPTURING=0, TRACK_MATCH_STATS=0): Tensor.ones(1024,1024).contiguous().realize(do_update_stats=False)
+    # not sure if this this is placebo or does it actually make things more stable
+    if p.device in {'CLANG', 'LLVM'}:
+      for buf in input_bufs:
+        CPUProgram.helper_handle["__clear_cache"](ctypes.c_void_p(mv_address(buf._buf)), ctypes.c_void_p(mv_address(buf._buf) + len(lib)))
     tms.append(cast(float, car(input_bufs, var_vals, wait=True))*factor)
     if early_stop is not None and early_stop < min(tms): break
   return tms

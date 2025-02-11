@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from collections import defaultdict
 from typing import Optional, Any, Iterator, Generator
+from threading import Thread
 import multiprocessing, importlib, inspect, functools, pathlib, os, ctypes, ctypes.util, platform, contextlib, sys, re, atexit, pickle, decimal, time
 from tinygrad.helpers import CI, OSX, LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, flat_mv, from_mv, PROFILE, temp, mv_address, \
                              cpu_time_execution, colored, Context, round_up
@@ -255,7 +256,7 @@ class CPUProgram:
 
       self.fxn = ctypes.CFUNCTYPE(None)(mv_address(self.mem))
 
-  def __call__(self, *bufs, vals=(), wait=False):
+  def _inner_call(self, *bufs, vals=()):
     args = list(bufs) + list(vals)
     # NOTE: replace this by --target={host's triple}-elf in clang args once we only support macos sequoia and later.
     # Apple relaxes abi requirement for stack arguments to always be at least 8 byte aligned on arm64
@@ -263,7 +264,17 @@ class CPUProgram:
     # This hack is required because clang/llvm bug doesn't allow us to just use {host's triple}+'-elf' (relocation failures)
     # The bug was fixed in https://github.com/llvm/llvm-project/commit/454cc36630296262cdb6360b60f90a64a97f7f1a but was only backported to xcode 16+
     if platform.machine() == "arm64" and OSX: args = args[:8] + [ctypes.c_int64(a) if isinstance(a, int) else a for a in args[8:]]
-    return cpu_time_execution(lambda: self.fxn(*args), enable=wait)
+    self.fxn(*args)
+
+  def __call__(self, *bufs, num_threads:int|None=None, vals=(), wait=False):
+    if num_threads is None:
+      return cpu_time_execution(lambda: self._inner_call(*bufs, vals=vals), enable=wait)
+    # print(f"Executing with {num_threads} threads")
+    threads = [Thread(target=self._inner_call, args=tuple(bufs), kwargs={'vals': (*vals, i)}, name=f'cpu_thread_{i}') for i in range(num_threads)]
+    st = time.perf_counter()
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    return time.perf_counter() - st
 
 # **************** for Compiled Devices ****************
 

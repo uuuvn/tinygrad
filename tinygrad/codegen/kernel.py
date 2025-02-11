@@ -1,5 +1,5 @@
 from __future__ import annotations
-import itertools, functools, math
+import itertools, functools, math, os
 from dataclasses import dataclass
 from collections import defaultdict
 from typing import Optional, cast, Final, Callable, Sequence
@@ -19,7 +19,7 @@ from tinygrad.codegen.rewriter import full_graph_rewrite
 from tinygrad.codegen.lowerer import rewrite_shapetracker_with_index, get_contraction
 
 class OptOps(Enum):
-  TC = auto(); UPCAST = auto(); UNROLL = auto(); LOCAL = auto() # noqa: E702
+  TC = auto(); UPCAST = auto(); UNROLL = auto(); LOCAL = auto(); THREAD = auto() # noqa: E702
   GROUP = auto(); GROUPTOP = auto(); NOLOCALS = auto(); PADTO = auto(); SWAP = auto() # noqa: E702
   def __lt__(self, x:OptOps): return self.value < x.value
 
@@ -94,6 +94,7 @@ class Kernel:
     self.tensor_core_opts: Optional[TensorCoreOptions] = None
     self.use_tensor_cores: int = 0
     self.dont_use_locals: bool = False
+    self.threads: int|None = None
 
     # group simplifies
     self.simplify_ones()
@@ -110,8 +111,8 @@ class Kernel:
     ret.sts = self.sts[:len(ret.bufs)+len(ret.reduceops)*2] # NOTE: must redo the local buffers with TC in beam
 
     # parameters for optimizations
-    ret.applied_opts, ret.group_for_reduces, ret.upcasted, ret.local_dims, ret.dont_use_locals = \
-      self.applied_opts[:], self.group_for_reduces, self.upcasted, self.local_dims, self.dont_use_locals
+    ret.applied_opts, ret.group_for_reduces, ret.upcasted, ret.local_dims, ret.threads, ret.dont_use_locals = \
+      self.applied_opts[:], self.group_for_reduces, self.upcasted, self.local_dims, self.threads, self.dont_use_locals
     ret.tensor_core, ret.tensor_core_opts, ret.use_tensor_cores = self.tensor_core, self.tensor_core_opts, self.use_tensor_cores
 
     return ret
@@ -164,7 +165,10 @@ class Kernel:
   # yellow -- normal upcasted dimensions
   def colors(self) -> list[str]:
     # first non local non reduce dims are global (blue)
-    colors = ["blue"] * self.global_dims if not self.dont_use_locals else ["BLUE"] * self.global_dims
+    if self.threads is not None:
+      colors = ["BLUE"] + (["blue"] * (self.global_dims-1))
+    else:
+      colors = ["blue"] * self.global_dims if not self.dont_use_locals else ["BLUE"] * self.global_dims
     # after global are local_dims; warp ones used in tensor cores must be closest to first_reduce (cyan)
     colors += ["cyan"] * self.local_dims
     # between first_reduce and first_reduce + group_for_reduces, they are late upcasted (green)
@@ -201,6 +205,7 @@ class Kernel:
   # insert_before : place to insert the new stuff
   def shift_to(self, axis, amount, top=False, insert_before=None):
     if insert_before is None: insert_before = self.shape_len
+    if self.threads is not None: check(axis != 0 and insert_before > 0, "can't mess up thread dim")
     move_axis = axis if top else axis+1
     if move_axis < insert_before: insert_before += 1
     self.reshape_and_permute(
@@ -391,6 +396,13 @@ class Kernel:
       check(axis < self.global_dims, "local is for globals")
       self.shift_to(axis, amt, insert_before=self.first_reduce)
       self.local_dims += 1
+    elif opt.op is OptOps.THREAD:
+      assert hasattr(self, 'threads'), dir(self)
+      check(self.threads is None, "OptOps.THREAD can only be applied once")
+      check(not self.opts.has_local, "target does not support threads")
+      check(axis < self.global_dims, "thread must be taken from global")
+      self.shift_to(axis, amt, insert_before=0)
+      self.threads = amt
     elif opt.op in {OptOps.GROUP, OptOps.GROUPTOP}:   # green
       check(self.opts.has_local and self.opts.has_shared, "target does not support local or shared mem")
       check(self.first_reduce + self.group_for_reduces <= axis < self.first_upcast, "must be reduce axis to group")
@@ -419,12 +431,14 @@ class Kernel:
       check(self.local_dims == 0 and self.group_for_reduces == 0, "can't have no locals with locals")
       self.dont_use_locals = True
     elif opt.op is OptOps.SWAP:
+      check(self.threads is None or (axis != 0 and amt != 0), "can't swap with thread dim")
       check(axis < amt < self.global_dims, f"swap is only for globals with axis < amt, getting {amt=}, {axis=}, {self.global_dims=}")
       permute = list(range(self.shape_len))
       permute[axis], permute[amt] = permute[amt], permute[axis]
       self.reshape_and_permute(None, tuple(permute))
     elif opt.op is OptOps.PADTO:
       check(not self.vars, "does not work with symbolic shape")
+      check(self.threads is None or axis > 0, "can't pad thread axis") # can be implemented if usefull
       check(axis < self.first_upcast, "cannot pad upcasted")
       # ok to pad SUM if all parent ALU ops have f(0) = 0
       if (r:=self.reduceop) is not None and self.first_reduce <= axis: check(r.arg[0] is Ops.ADD and can_pad(r, {}, {}), f"cannot pad {r}")
@@ -443,6 +457,14 @@ class Kernel:
       self.tensor_core_opts.fix_axes(axis) # fix up axes in TC opts if required after simplify_ones()
 
   def required_optimizations(self) -> Kernel:
+    if self.threads is None and (CPUS:=getenv("CPU_FORCE_THREADS")):
+      for threads in reversed(range(2, CPUS+1)):
+        for axis,amt in enumerate(self.full_shape[:self.global_dims]):
+          if amt % threads == 0:
+            self.apply_opt(Opt(OptOps.THREAD, axis, threads))
+            break
+        if self.threads is not None: break # HACK: self.threads is not None is "unreachable"
+      if DEBUG>=2: print("WARNING: Couldn't apply forced threads")
     if isinstance(self.membufs[0].dtype, ImageDType):
       unit_stride_axes_mul_4 = [i for i in self.sts[0].unit_stride_axes(ignore_valid=True) if self.sts[0].shape[i]%4 == 0]
       assert unit_stride_axes_mul_4, f"needs a unit stride axis in {self.bufs[0]}"
@@ -504,7 +526,7 @@ class Kernel:
     # this can be made much smarter
     to_upcast: list[int] = []
     # upcast leading axes first (hack-ish for winograd; we actually want to upcast masked axes with low stride first)
-    for axis in range(self.first_reduce):
+    for axis in range(1 if self.threads is not None else 0, self.first_reduce):
       # we might want to be able to split axes that are masked, or refuse to merge them in simplify_merge_adjacent
       # for now skip upcasting here if there is a symbolic axis
       if isinstance(self.full_shape[axis], int) and self.full_shape[axis] <= 7 and any(st.axis_is_masked(axis) for st in self.sts) and \
@@ -517,7 +539,7 @@ class Kernel:
     upcasted_axis = set()
     while resolve(prod(self.sts[0].shape[:self.first_reduce]) >= 1024):
       xb_choices = []
-      for axis, upcast_amount in itertools.product(range(self.first_reduce), [3,4]):   # consider all the non reduce axes, and a 3 or 4 reduce
+      for axis, upcast_amount in itertools.product(range(1 if self.threads is not None else 0, self.first_reduce), [3,4]):   # consider all the non reduce axes, and a 3 or 4 reduce
         # if we haven't upcasted it, it's not symbolic, it mods, and buffer has stride 0 on axis while having no stride 0 in the upcasted axis already
         if axis not in upcasted_axis and isinstance(self.full_shape[axis], int) and self.full_shape[axis]%upcast_amount == 0 and any(st.views[-1].strides[axis] == 0 and not any(x[1] == 0 for x in self.upcasted_axis(buf_index)) for buf_index, st in enumerate(self.sts)):  # noqa: E501
           xb_choices.append((sum(st.views[-1].strides[axis]>0 for st in self.sts), sum(st.views[-1].strides[axis] for st in self.sts), axis, upcast_amount))  # noqa: E501
@@ -566,6 +588,13 @@ class Kernel:
           will_delete_shape = local_sz == self.full_shape[axis]
           self.apply_opt(Opt(OptOps.LOCAL, axis, local_sz))
           if will_delete_shape: deleted_shape += 1
+    elif self.threads is None and (CPUS:=os.cpu_count()) is not None:
+      for threads in reversed(range(2, CPUS+1)):
+        for axis,amt in enumerate(self.full_shape[:self.global_dims]):
+          if amt % threads == 0:
+            self.apply_opt(Opt(OptOps.THREAD, axis, threads))
+            break
+        if self.threads is not None: break # HACK: self.threads is not None is "unreachable"
 
     return self
 
@@ -585,6 +614,11 @@ class Kernel:
     return name + colored(num, 'BLACK')
 
   def get_optimized_ast(self) -> UOp:
+    if self.threads is not None and self.full_shape[0] != self.threads:
+      print('ERROR ERROR ERROR')
+      print(self.threads, self.full_shape, self.applied_opts)
+      exit(1)
+      assert self.full_shape[0] == self.threads
     @functools.lru_cache(None)
     def fixup_ast(op:UOp) -> UOp:
       ret = op.replace(src=tuple(fixup_ast(x) for x in op.src))
@@ -594,7 +628,7 @@ class Kernel:
         if op.op is Ops.CONST and any(v.mask is not None for v in unwrap(st_uop.st).views): return op.valid(unwrap(st_uop.st))
         # otherwise we just replace the VIEW source
         return ret.replace(src=(st_uop,)) if len(op.src) == 1 else ret.replace(src=(ret.src[0], st_uop, *ret.src[2:]))
-      if op.op is Ops.SINK: return ret.replace(arg = KernelInfo(self.local_dims, self.upcasted, self.dont_use_locals))
+      if op.op is Ops.SINK: return ret.replace(arg = KernelInfo(self.local_dims, self.upcasted, self.dont_use_locals, self.threads))
       if op.op is Ops.REDUCE_AXIS:
         reduce_idx = len(self.bufs) + self.reduceops.index(op) * 2
 
@@ -693,5 +727,5 @@ class Kernel:
     mem_bytes = sum(max(x.src[0].dtype.itemsize * x.st_arg.real_size() for x in group)
       for _, group in itertools.groupby([x for x in self.ast.toposort if x.op in GroupOp.Buffer and x.src[0].op is Ops.DEFINE_GLOBAL],
                         key=lambda x: (x.op, x.src[0].arg)))
-    return ProgramSpec(ansiname, src, self.opts.device, self.uops, mem_estimate=mem_bytes,
+    return ProgramSpec(ansiname, src, self.opts.device, self.uops, mem_estimate=mem_bytes, num_threads=self.threads,
                    global_size=[1,1,1] if self.opts.has_local else None, local_size=[1,1,1] if self.opts.has_local else None)
