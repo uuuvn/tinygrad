@@ -5,6 +5,7 @@ from tinygrad.ops import UOp, Ops, PatternMatcher, UPat, graph_rewrite, GroupOp
 from tinygrad.spec import type_verify
 from tinygrad.dtype import dtypes, PtrDType
 from tinygrad.helpers import dedup, flatten, partition
+from tinygrad.renderer import Renderer
 
 DONT_PLACE_IN_BLOCK = {Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL, Ops.DEFINE_VAR, Ops.SPECIAL, Ops.CONST, *GroupOp.Block}
 
@@ -147,7 +148,7 @@ def block_reorder(in_block:UOp):
   assert len(newlst) == len(in_block.arg.lst), f"len mismatch {len(newlst)} != {len(in_block.arg.lst)}"
   return in_block.replace(arg=BasicBlock(in_block.arg.ctx, tuple(newlst)))
 
-def linearize_uop(sink:UOp, skip_check:bool=not __debug__) -> list[UOp]:
+def linearize_uop(sink:UOp, skip_check:bool=not __debug__, opts: Renderer|None=None) -> list[UOp]:
   assert sink.op is Ops.SINK, f"sink isn't sink, it's {sink.op}"
 
   # get children and all block contexts
@@ -219,7 +220,8 @@ def linearize_uop(sink:UOp, skip_check:bool=not __debug__) -> list[UOp]:
   _uops += sink.arg.lst
 
   # sanity checks (NOTE: these can cause things to be skipped in BEAM)
-  if not skip_check: type_verify(_uops)
+  extra_spec = [opts.extra_spec] if opts is not None and hasattr(opts, 'extra_spec') else []
+  if not skip_check: type_verify(_uops, *extra_spec)
 
   # strip the SINK
   return _uops[:-1]

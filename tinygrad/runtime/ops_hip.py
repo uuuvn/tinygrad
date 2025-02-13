@@ -4,6 +4,7 @@ from tinygrad.device import Compiled, LRUAllocator, BufferSpec
 from tinygrad.runtime.autogen import hip
 from tinygrad.runtime.support.compiler_hip import AMDCompiler
 from tinygrad.renderer.cstyle import HIPRenderer
+from tinygrad.renderer.rdna import RDNARenderer
 if getenv("IOCTL"): import extra.hip_gpu_driver.hip_ioctl  # noqa: F401 # pylint: disable=unused-import
 
 def check(status):
@@ -14,7 +15,7 @@ class HIPDevice(Compiled):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
     self.arch = init_c_var(hip.hipDeviceProp_t(), lambda x: check(hip.hipGetDeviceProperties(x, self.device_id))).gcnArchName.decode()
     self.time_event_st, self.time_event_en = [init_c_var(hip.hipEvent_t(), lambda x: hip.hipEventCreate(ctypes.byref(x), 0)) for _ in range(2)]
-    super().__init__(device, HIPAllocator(self), HIPRenderer(), AMDCompiler(self.arch), functools.partial(HIPProgram, self))
+    super().__init__(device, HIPAllocator(self), HIPRenderer() if not getenv("RDNA", 1) else RDNARenderer(self.arch), AMDCompiler(self.arch, asm=bool(getenv("RDNA", 1))), functools.partial(HIPProgram, self)) # noqa: E501
   def synchronize(self):
     check(hip.hipSetDevice(self.device_id))
     check(hip.hipDeviceSynchronize())

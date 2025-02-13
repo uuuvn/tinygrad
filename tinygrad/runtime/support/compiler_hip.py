@@ -1,5 +1,7 @@
 import ctypes, subprocess
 import tinygrad.runtime.autogen.comgr as comgr
+from tinygrad.helpers import OSX, DEBUG
+from tinygrad.renderer.support.rdna_asm import tinyasm_to_llvm
 from tinygrad.device import Compiler, CompileError
 
 def check(status):
@@ -30,6 +32,7 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
   check(comgr.amd_comgr_set_data(data_src, len(rprg := prg.encode()), rprg))
 
   if asm:
+    if DEBUG>=7: print(prg)
     check(comgr.amd_comgr_set_data_name(data_src, b"<null>.s"))
     check(comgr.amd_comgr_data_set_add(data_set_src, data_src))
     status = comgr.amd_comgr_do_action(comgr.AMD_COMGR_ACTION_ASSEMBLE_SOURCE_TO_RELOCATABLE, action_info, data_set_src, data_set_reloc)
@@ -57,12 +60,15 @@ def compile_hip(prg:str, arch="gfx1100", asm=False) -> bytes:
   return ret
 
 class AMDCompiler(Compiler):
-  def __init__(self, arch:str):
-    self.arch = arch
-    super().__init__(f"compile_hip_{self.arch}")
+  def __init__(self, arch:str, asm:bool=False):
+    self.arch, self.asm = arch, asm
+    super().__init__(f"compile_hip_{self.arch}{'_asm' if self.asm else ''}")
   def compile(self, src:str) -> bytes:
-    try: return compile_hip(src, self.arch)
+    try: return compile_hip(tinyasm_to_llvm(src) if self.asm else src, self.arch, asm=self.asm)
     except RuntimeError as e: raise CompileError(e) from e
   def disassemble(self, lib:bytes):
-    asm = subprocess.check_output(["/opt/rocm/llvm/bin/llvm-objdump", '-d', '-'], input=lib)
+    if OSX:
+      asm = subprocess.check_output(["llvm-objdump", '-d', '-'], input=lib)
+    else:
+      asm = subprocess.check_output(["/opt/rocm/llvm/bin/llvm-objdump", '-d', '-'], input=lib)
     print('\n'.join([x for x in asm.decode('utf-8').split("\n") if 's_code_end' not in x]))

@@ -3,7 +3,7 @@ import itertools, functools, random, math, time, multiprocessing, traceback, sig
 from collections import defaultdict
 from dataclasses import replace
 from tinygrad.ops import UOp, Ops, Variable, sym_infer
-from tinygrad.device import Device, Buffer, Compiler
+from tinygrad.device import Device, Buffer, Compiler, GracefulSkip
 from tinygrad.helpers import prod, flatten, DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, Context, colored
 from tinygrad.helpers import IGNORE_BEAM_CACHE, TC_SEARCH_OVER_SHAPE
 from tinygrad.dtype import ImageDType, PtrDType
@@ -70,9 +70,11 @@ def _try_compile_linearized_w_idx(x:tuple[int,Kernel], compiler:Compiler) -> tup
     prog = compiler.compile(p.src)
     et = time.perf_counter() - st
     ret = (p, prog, et)
+  except GracefulSkip: pass
   except RuntimeError:
-    if DEBUG >= 4: traceback.print_exc()
+    if DEBUG >= 4 or getenv("BEAM_PRINT_ERROR"): traceback.print_exc()
   except Exception as e:
+    if DEBUG >= 4 or getenv("BEAM_PRINT_ERROR"): traceback.print_exc()
     if getenv("BEAM_STRICT_MODE"): raise e
   finally:
     if hasattr(signal, "alarm"): signal.alarm(0)
@@ -167,7 +169,9 @@ def beam_search(lin:Kernel, rawbufs:list[Buffer], amt:int, allow_test_size=True,
         if least_compute_ops*1000 < this_compute_ops: continue
         seen_libs.add(lib)
         try: tms = _time_program(p, lib, var_vals, rawbufs, early_stop=beam[0][1]*3 if len(beam) else 1.0, clear_l2=hasattr(dev, 'invalidate_caches'))
-        except RuntimeError: continue # for runtime issues
+        except RuntimeError:
+          if DEBUG >= 4 or getenv("BEAM_PRINT_ERROR"): traceback.print_exc()
+          continue # for runtime issues
         timed_lins.append((acted_lins[i], min(tms)))
         if BEAM_DEBUG > 1: print(f"{time.perf_counter() - st:7.2f}s: {i:5d} {len(cast(list, p.uops)):5d} uops {compile_et*1e6:12.2f} us compile/{timed_lins[-1][1]*1e6:12.2f} us run       {len(timed_lins):4d}/{len(acted_lins):4d}         {timed_lins[-1][0].colored_shape()}")  # noqa: E501
         elif DEBUG >= 2: print(f"\r{time.perf_counter() - st:7.2f}s: {timed_lins[-1][1]*1e6:12.2f} us       {len(timed_lins):4d}/{len(acted_lins):4d}         {timed_lins[-1][0].colored_shape()}\033[K", end="")  # noqa: E501

@@ -7,6 +7,7 @@ from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, H
 from tinygrad.ops import sint
 from tinygrad.device import BufferSpec, CPUProgram
 from tinygrad.helpers import getenv, to_mv, round_up, data64_le, mv_address, DEBUG, OSX
+from tinygrad.renderer.rdna import RDNARenderer
 from tinygrad.renderer.cstyle import AMDRenderer
 from tinygrad.runtime.autogen import kfd, hsa, amd_gpu, libc, pci, vfio
 from tinygrad.runtime.autogen.am import am
@@ -594,7 +595,8 @@ class AMDDevice(HCQCompiled):
 
     self.sdma_queue = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x800000)
 
-    super().__init__(device, AMDAllocator(self), AMDRenderer(), AMDCompiler(self.arch), functools.partial(AMDProgram, self),
+    renderer = RDNARenderer(self.arch) if getenv("RDNA", 1) else AMDRenderer()
+    super().__init__(device, AMDAllocator(self), renderer, AMDCompiler(self.arch, asm=getenv("RDNA", 1)), functools.partial(AMDProgram, self),
                      AMDSignal, AMDComputeQueue, AMDCopyQueue)
 
     # Scratch setup
