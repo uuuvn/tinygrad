@@ -5,6 +5,7 @@ from tinygrad.ops import UOp, Ops, PatternMatcher, UPat, graph_rewrite, GroupOp
 from tinygrad.spec import type_verify
 from tinygrad.dtype import dtypes, PtrDType
 from tinygrad.helpers import dedup, flatten, partition
+from tinygrad.renderer import Renderer
 
 DONT_PLACE_IN_BLOCK = {Ops.DEFINE_GLOBAL, Ops.DEFINE_LOCAL, Ops.DEFINE_VAR, Ops.SPECIAL, Ops.CONST, *GroupOp.Block}
 
@@ -112,12 +113,25 @@ def block_merge(ctx, x:UOp):
 
 pm_block_merge = PatternMatcher([(UPat((Ops.BLOCKEND, Ops.BLOCK), name="x"), block_merge),])
 
+class GenericScheduler:
+  def __init__(self, uops: list[UOp], local_children:dict[UOp, list[UOp]]):
+    self.queue:list[tuple[int, tuple, UOp]] = []
+    self.priorities:dict[UOp, int] = {}
+    # get local children and assign priorities
+    for u in reversed(uops):
+      self.priorities[u] = min([-1000 if u.op is Ops.LOAD else 0] + [self.priorities[x] for x in local_children[u]])
+  def push(self, u):
+    heapq.heappush(self.queue, (self.priorities[u], u.tuplize, u))
+  def pick(self):
+    return heapq.heappop(self.queue)[2]
+  def avail(self):
+    return len(self.queue)
+
 # NOTE: any toposort should be valid here, unlike last time this isn't required, it's just for speed
-def block_reorder(in_block:UOp):
+def block_reorder(in_block:UOp, opts:Renderer|None=None):
   in_this_block = set(in_block.arg.lst)
   local_children: collections.defaultdict[UOp, list[UOp]] = collections.defaultdict(list)
   in_degree: collections.defaultdict[UOp, int] = collections.defaultdict(int)
-  priorities:dict[UOp, int] = {}
 
   # get local children and assign priorities
   for u in reversed(in_block.arg.lst):
@@ -125,29 +139,25 @@ def block_reorder(in_block:UOp):
       if s in in_this_block:
         local_children[s].append(u)
         in_degree[u] += 1
-    # put loads in the beginning of the block and prevent priority inversion
-    priorities[u] = min([-1000 if u.op is Ops.LOAD else 0] + [priorities[x] for x in local_children[u]])
 
-  # placement queue
-  queue:list[tuple[int, tuple, UOp]] = []
-  def push(u:UOp): heapq.heappush(queue, (priorities[u], u.tuplize, u))
+  sched = (opts.custom_scheduler if opts is not None and hasattr(opts, 'custom_scheduler') else GenericScheduler)(in_block.arg.lst, local_children)
 
   # place the first ones that don't have deps
   for u in in_block.arg.lst:
-    if u not in in_degree: push(u)
+    if u not in in_degree: sched.push(u)
 
   newlst = []
-  while queue:
-    _,_,x = heapq.heappop(queue)
+  while sched.avail():
+    x = sched.pick()
     newlst.append(x)
     for u in local_children[x]:
       in_degree[u] -= 1
-      if in_degree[u] == 0: push(u)
+      if in_degree[u] == 0: sched.push(u)
 
   assert len(newlst) == len(in_block.arg.lst), f"len mismatch {len(newlst)} != {len(in_block.arg.lst)}"
   return in_block.replace(arg=BasicBlock(in_block.arg.ctx, tuple(newlst)))
 
-def linearize_uop(sink:UOp, skip_check:bool=not __debug__) -> list[UOp]:
+def linearize_uop(sink:UOp, skip_check:bool=not __debug__, opts: Renderer|None=None) -> list[UOp]:
   assert sink.op is Ops.SINK, f"sink isn't sink, it's {sink.op}"
 
   # get children and all block contexts
@@ -207,7 +217,7 @@ def linearize_uop(sink:UOp, skip_check:bool=not __debug__) -> list[UOp]:
   sink = sink.substitute(new_forks)
 
   # reorder ops in block for speed
-  sink = sink.substitute({u:newu for u in sink.toposort if u.op is Ops.BLOCK and (newu:=block_reorder(u)) is not u})
+  sink = sink.substitute({u:newu for u in sink.toposort if u.op is Ops.BLOCK and (newu:=block_reorder(u, opts)) is not u})
 
   # final rewrite to merge all blocks into one
   sink = graph_rewrite(sink, pm_block_merge, ctx=children)
@@ -219,7 +229,8 @@ def linearize_uop(sink:UOp, skip_check:bool=not __debug__) -> list[UOp]:
   _uops += sink.arg.lst
 
   # sanity checks (NOTE: these can cause things to be skipped in BEAM)
-  if not skip_check: type_verify(_uops)
+  extra_spec = [opts.extra_spec] if opts is not None and hasattr(opts, 'extra_spec') else []
+  if not skip_check: type_verify(_uops, *extra_spec)
 
   # strip the SINK
   return _uops[:-1]

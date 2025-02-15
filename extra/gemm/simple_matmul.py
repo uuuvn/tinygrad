@@ -18,7 +18,8 @@ if __name__ == "__main__":
   def init_matrix(rows, cols):
     if dtype_in in dtypes.ints:
       return Tensor.randint((rows, cols), dtype=dtype_in).realize()
-    return Tensor.rand(rows, cols, dtype=dtype_in).realize()
+    return Tensor(np.random.rand(rows, cols), dtype=dtype_in).realize()
+    # return Tensor.rand(rows, cols, dtype=dtype_in).realize()
 
   a, b = init_matrix(M, K), init_matrix(K, N)
   for i in range(CNT):

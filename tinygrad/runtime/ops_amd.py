@@ -1,12 +1,14 @@
 from __future__ import annotations
 from typing import Any, cast
-import os, ctypes, ctypes.util, functools, mmap, errno, array, contextlib, sys, select, atexit
+import os, ctypes, ctypes.util, functools, pickle, mmap, errno, array, contextlib, sys, select, atexit
 assert sys.platform != 'win32'
 from dataclasses import dataclass
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQBuffer, HWQueue, CLikeArgsState, HCQSignal, HCQProgram, HWInterface
 from tinygrad.ops import sint
 from tinygrad.device import BufferSpec, CPUProgram
 from tinygrad.helpers import getenv, to_mv, round_up, data64_le, mv_address, DEBUG, OSX
+from tinygrad.renderer.support.rdna_asm import TinyProgram, RDNACompiler
+from tinygrad.renderer.rdna import RDNARenderer
 from tinygrad.renderer.cstyle import AMDRenderer
 from tinygrad.runtime.autogen import kfd, hsa, amd_gpu, libc, pci, vfio
 from tinygrad.runtime.autogen.am import am
@@ -23,6 +25,7 @@ WAIT_REG_MEM_FUNCTION_GEQ = 5 # >=
 COMPUTE_SHADER_EN, FORCE_START_AT_000, CS_W32_EN = (1 << 0), (1 << 2), (1 << 15)
 
 def gfxreg(reg): return reg + 0x00001260 - amd_gpu.PACKET3_SET_SH_REG_START
+def sqreg(reg): return reg + 0x0000A000 - amd_gpu.PACKET3_SET_CONFIG_REG_START
 def nbioreg(reg): return reg + 0x00000d20 # NBIO_BASE__INST0_SEG2
 
 class AMDSignal(HCQSignal):
@@ -75,7 +78,7 @@ class AMDComputeQueue(HWQueue):
     self.acquire_mem()
     return self
 
-  def exec(self, prg:AMDProgram, args_state:CLikeArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...]):
+  def exec(self, prg:AMDProgram|RDNAProgram, args_state:CLikeArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...]):
     self.bind_args_state(args_state)
 
     self.acquire_mem(gli=0, gl2=0)
@@ -86,7 +89,7 @@ class AMDComputeQueue(HWQueue):
       # sgpr word3 = 0x14 << 12 | 2 << 28 | 2 << 21 | 1 << 23
       user_regs = [scratch_hilo[0], scratch_hilo[1] | 1 << 31, 0xffffffff, 0x20c14000] if prg.enable_private_segment_sgpr else []
     else: user_regs = []
-    if prg.enable_dispatch_ptr:
+    if isinstance(prg, AMDProgram) and prg.enable_dispatch_ptr:
       dp = hsa.hsa_kernel_dispatch_packet_t.from_address(dp_addr:=args_state.ptr + prg.kernargs_segment_size)
 
       self.bind_sints(*local_size, struct=dp, start_field='workgroup_size_x', fmt='H')
@@ -97,6 +100,8 @@ class AMDComputeQueue(HWQueue):
     user_regs += [*data64_le(args_state.ptr)]
 
     self.pkt3(amd_gpu.PACKET3_SET_SH_REG, gfxreg(amd_gpu.regCOMPUTE_PGM_LO), *data64_le(prg.prog_addr >> 8))
+    if isinstance(prg, RDNAProgram) and prg.trap_addr is not None:
+      self.pkt3(amd_gpu.PACKET3_SET_CONFIG_REG, sqreg(amd_gpu.regSQ_SHADER_TBA_LO), *data64_le((prg.trap_addr >> 8)|(1<<63)))
     self.pkt3(amd_gpu.PACKET3_SET_SH_REG, gfxreg(amd_gpu.regCOMPUTE_PGM_RSRC1), prg.rsrc1, prg.rsrc2)
     self.pkt3(amd_gpu.PACKET3_SET_SH_REG, gfxreg(amd_gpu.regCOMPUTE_PGM_RSRC3), 0)
     self.pkt3(amd_gpu.PACKET3_SET_SH_REG, gfxreg(amd_gpu.regCOMPUTE_TMPRING_SIZE), prg.dev.tmpring_size)
@@ -236,6 +241,42 @@ class AMDCopyQueue(HWQueue):
       dev.sdma_queue.put_value += rem_packet_cnt * 4
 
     dev.sdma_queue.signal_doorbell()
+
+class RDNAProgram(HCQProgram):
+  def __init__(self, dev:AMDDevice, name:str, lib:bytes):
+    self.dev: AMDDevice = dev
+    self.name, self.lib = name, lib
+    prg: TinyProgram = pickle.loads(lib)
+    code = prg.kernel + b'\x00'*(round_up(len(prg.kernel),256)-len(prg.kernel)) + prg.trap_handler
+    self.lib_gpu = self.dev.allocator.alloc(round_up(len(code), 0x1000), BufferSpec(cpu_access=True, nolru=True))
+    ctypes.memmove(self.lib_gpu.va_addr, code, len(code))
+
+    self.group_segment_size = prg.group_size
+    self.private_segment_size = prg.private_size
+    self.kernargs_segment_size = prg.kernarg_size
+
+    lds_size = ((self.group_segment_size + 511) // 512) & 0x1FF
+    if lds_size > (self.dev.dev_iface.props['lds_size_in_kb'] * 1024) // 512: raise RuntimeError("Too many resources requested: group_segment_size")
+
+    # Ensure scratch size
+    self.dev._ensure_has_local_memory(self.private_segment_size)
+
+    assert 0<=prg.vgpr_count<2**8, prg.vgpr_count
+    USER_SGPR_COUNT = 2 # s[0:1] for kernarg addr
+    ENABLE_SGPR_WORKGROUP_ID_XYZ = 0b111 # xyz
+    ENABLE_VGPR_WORKITEM_ID = 2 # xyz
+    BUGGY_PRIV = False
+    self.rsrc1: int = max(0, ((prg.vgpr_count+7)//8)-1) | (int(bool(BUGGY_PRIV))<<20)
+    self.rsrc2: int = lds_size << 15 | ENABLE_VGPR_WORKITEM_ID << 11 | ENABLE_SGPR_WORKGROUP_ID_XYZ << 7 | int(len(prg.trap_handler) > 0) << 6 | USER_SGPR_COUNT << 1 | int(prg.private_size > 0) # noqa: E501
+    self.prog_addr: int = self.lib_gpu.va_addr
+    self.trap_addr: int|None = (self.lib_gpu.va_addr + round_up(len(prg.kernel), 256)) if len(prg.trap_handler) > 0 else None
+
+    self.enable_private_segment_sgpr: int = int(self.private_segment_size > 0)
+
+    super().__init__(CLikeArgsState, self.dev, self.name, kernargs_alloc_size=self.kernargs_segment_size)
+
+  def __del__(self):
+    if hasattr(self, 'lib_gpu'): self.dev.allocator.free(self.lib_gpu, self.lib_gpu.size, BufferSpec(cpu_access=True, nolru=True))
 
 class AMDProgram(HCQProgram):
   def __init__(self, dev:AMDDevice, name:str, lib:bytes):
@@ -594,8 +635,10 @@ class AMDDevice(HCQCompiled):
 
     self.sdma_queue = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x800000)
 
-    super().__init__(device, AMDAllocator(self), AMDRenderer(), AMDCompiler(self.arch), functools.partial(AMDProgram, self),
-                     AMDSignal, AMDComputeQueue, AMDCopyQueue)
+    renderer = RDNARenderer(self.arch) if getenv("RDNA", 1) else AMDRenderer()
+    compiler = RDNACompiler() if getenv("RDNA", 1) else AMDCompiler(self.arch)
+    runtime = functools.partial(RDNAProgram if getenv("RDNA", 1) else AMDProgram, self)
+    super().__init__(device, AMDAllocator(self), renderer, compiler, runtime, AMDSignal, AMDComputeQueue, AMDCopyQueue)
 
     # Scratch setup
     self.max_private_segment_size = 0

@@ -270,6 +270,7 @@ class CPUProgram:
 # **************** for Compiled Devices ****************
 
 class CompileError(Exception): pass
+class GracefulSkip(Exception): pass
 
 class Compiler:
   def __init__(self, cachekey:Optional[str]=None): self.cachekey = None if getenv("DISABLE_COMPILER_CACHE") else cachekey
