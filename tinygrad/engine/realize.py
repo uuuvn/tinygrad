@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from tinygrad.helpers import all_same, colored, getenv, DEBUG, GlobalCounters, ansilen, BEAM, NOOPT, all_int, CAPTURING, Metadata, TRACEMETA
 from tinygrad.helpers import DEVECTORIZE, time_to_str
 from tinygrad.ops import Ops, PatternMatcher, UOp, UPat, Variable, sym_infer
-from tinygrad.device import Device, Buffer
+from tinygrad.device import Device, Buffer, CPUProgram
 from tinygrad.renderer import Renderer, ProgramSpec, Estimates
 from tinygrad.codegen.kernel import Kernel
 from tinygrad.engine.schedule import ScheduleItem
@@ -51,7 +51,7 @@ class CompiledRunner(Runner):
 
   def __call__(self, rawbufs:list[Buffer], var_vals:dict[Variable, int], wait=False) -> Optional[float]:
     global_size, local_size = self.p.launch_dims(var_vals)
-    if global_size is not None and local_size is None and all_int(self.p.global_size): # type: ignore[arg-type]
+    if not isinstance(self._prg, CPUProgram) and global_size is not None and local_size is None and all_int(self.p.global_size): # type: ignore[arg-type]
       # TODO: this is copied from get_program
       from tinygrad.engine.search import optimize_local_size
       local_size = optimize_local_size(self._prg, global_size, rawbufs)

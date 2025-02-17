@@ -112,7 +112,6 @@ class LLVMRenderer(Renderer):
   supports_float4 = True
   has_local = False
   has_shared = False
-  global_max = None
   string_rewrite = base_rewrite
   if AMX: tensor_cores = ClangRenderer.amx_tc
 
@@ -153,7 +152,7 @@ class LLVMRenderer(Renderer):
       if u.op is Ops.NAME:
         name = u.arg
         continue
-      if u.op in (Ops.DEFINE_GLOBAL, Ops.DEFINE_VAR):
+      if u.op in (Ops.DEFINE_GLOBAL, Ops.DEFINE_VAR, Ops.SPECIAL):
         r[u] = f"%data{u.arg}" if u.op is Ops.DEFINE_GLOBAL else f"%{u.arg[0]}"
         # NOTE: MallocAllocator promises 0x20 alignment
         args.append(f"{ldt(u.dtype)}{' noalias align 32' if isinstance(u.dtype, PtrDType) else ''} {r[u]}")

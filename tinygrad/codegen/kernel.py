@@ -8,7 +8,7 @@ from enum import Enum, auto
 from tinygrad.ops import GroupOp, KernelInfo, UOp, Ops, can_pad, resolve, Variable, sint, graph_rewrite, track_rewrites, view_left, print_uops
 from tinygrad.ops import PatternMatcher
 from tinygrad.spec import type_verify, shape_spec
-from tinygrad.device import Device
+from tinygrad.device import Device, CPUProgram
 from tinygrad.renderer import Renderer, TensorCore, ProgramSpec
 from tinygrad.dtype import ImageDType
 from tinygrad.helpers import all_same, colored, ansilen, dedup, getenv, prod, round_up, all_int, to_function_name, diskcache_put, unwrap, ContextVar
@@ -373,7 +373,8 @@ class Kernel:
     elif opt.arg is not None:
       check(isinstance(opt.arg, int), "arg should be int")
       amt = arg if (arg:=cast(int, opt.arg)) != 0 else self.full_shape[axis]
-      check(isinstance(amt, int) and amt != 1, f"shift/padto of {amt=}, 1 or symbolic amount is meaningless")
+      if amt < 0 and self.full_shape[axis] > (-amt) and self.full_shape[axis] % (-amt) == 0: amt = self.full_shape[axis] // (-amt)
+      check(isinstance(amt, int) and amt != 1 and amt >= 0, f"shift/padto of {amt=}, 1 or symbolic amount is meaningless")
       if opt.op is not OptOps.PADTO: check(self.full_shape[axis] % amt == 0, f"no longer valid shift {self.full_shape[axis]=}, {amt=}")
     else: amt = -1
 
@@ -386,9 +387,10 @@ class Kernel:
       check(smem_sz <= self.opts.shared_max, f"exceeds maximum shared memory size: needs {smem_sz}, max {self.opts.shared_max}")
 
     if opt.op is OptOps.LOCAL:    # cyan
-      # NOTE: LLVM/CLANG can use locals too, but they are treated the same as globals (still helpful for L1 cache)
-      # it's disabled for now since it makes BEAM slow for little gain
-      check(self.opts.has_local, "target does not support local")
+      # NOTE: LLVM/CLANG can use locals too, but they are just loops (still helpful for L1 cache and loops in machine code are significantly faster
+      # than calling ctypes function in a loop)
+      # Negative amount means "leave X as global" and is only used by CPU backends
+      check(self.opts.has_local != (cast(int, opt.arg) < 0), "invalid local for target")
       check(axis < self.global_dims, "local is for globals")
       self.shift_to(axis, amt, insert_before=self.first_reduce)
       self.local_dims += 1
@@ -550,23 +552,25 @@ class Kernel:
 
     # **** local groups ****
 
-    if self.opts.has_local:
-      if getenv("NOLOCALS") and self.local_dims == 0 and not self.group_for_reduces:
-        self.apply_opt(Opt(OptOps.NOLOCALS))
-      else:
-        # prioritize making expand axes local
-        local_axis_ranking = [(any(self.sts[buf_index].views[-1].strides[axis] == 0 for buf_index in range(len(self.sts))), axis) for axis in range(len(self.full_shape[:self.first_reduce]))]  # noqa: E501
-        to_local: list[tuple[int, int]] = []
-        for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
-          local_size = prod(sz for _, sz in to_local)
+    if getenv("NOLOCALS") and self.local_dims == 0 and not self.group_for_reduces:
+      self.apply_opt(Opt(OptOps.NOLOCALS))
+    else:
+      # prioritize making expand axes local
+      local_axis_ranking = [(any(self.sts[buf_index].views[-1].strides[axis] == 0 for buf_index in range(len(self.sts))), axis) for axis in range(len(self.full_shape[:self.first_reduce]))]  # noqa: E501
+      to_local: list[tuple[int, int]] = []
+      for _, axis in sorted(local_axis_ranking, key=lambda x: (-x[0], -x[1])):
+        local_size = prod(sz for _, sz in to_local)
+        if self.opts.has_local:
           local_sz: Optional[int] = next((x for x in ([32] * (axis == 0) + [16, 8, 4, 3, 2]) if self.full_shape[axis] % x == 0 and local_size * x <= 128), None)  # noqa: E501
-          if local_sz is not None: to_local.append((axis, local_sz))
-        deleted_shape = 0
-        for axis, local_sz in sorted(to_local[:3]):
-          axis = axis - deleted_shape
-          will_delete_shape = local_sz == self.full_shape[axis]
-          self.apply_opt(Opt(OptOps.LOCAL, axis, local_sz))
-          if will_delete_shape: deleted_shape += 1
+        else:
+          local_sz = next((-x for x in reversed(range(2, CPUProgram.ncpus)) if self.full_shape[axis] % x == 0 and self.full_shape[axis] > x), None)
+        if local_sz is not None: to_local.append((axis, local_sz))
+      deleted_shape = 0
+      for axis, local_sz in sorted(to_local[:3]):
+        axis = axis - deleted_shape
+        will_delete_shape = abs(local_sz) == self.full_shape[axis]
+        self.apply_opt(Opt(OptOps.LOCAL, axis, local_sz))
+        if will_delete_shape: deleted_shape += 1
 
     return self
 
@@ -702,4 +706,4 @@ class Kernel:
       for _, group in itertools.groupby([x for x in self.ast.toposort if x.op in GroupOp.Buffer and x.src[0].op is Ops.DEFINE_GLOBAL],
                         key=lambda x: (x.op, x.src[0].arg)))
     return ProgramSpec(self.name if not name_override else name_override, src, self.opts.device, self.ast, self.uops, mem_estimate=mem_bytes,
-                       global_size=[1,1,1] if self.opts.has_local else None, local_size=[1,1,1] if self.opts.has_local else None)
+                       global_size=[1,1,1], local_size=[1,1,1] if self.opts.has_local else None)

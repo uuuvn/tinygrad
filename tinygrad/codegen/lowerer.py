@@ -89,7 +89,8 @@ def get_index(ast:UOp, opts:Renderer) -> IndexContext:
              get_grouped_dims("lidx", full_shape[global_dims:first_reduce+group_for_reduces], opts.local_max)
   else:
     # all loops are RANGES
-    idxs = [UOp(Ops.RANGE, dtypes.int, (sint_to_uop(0), sint_to_uop(g)), i) for i,g in enumerate(full_shape[:first_reduce])]
+    idxs = get_grouped_dims("gidx", full_shape[:global_dims], opts.global_max, reverse=True) + \
+           [UOp(Ops.RANGE, dtypes.int, (sint_to_uop(0), sint_to_uop(g)), i) for i,g in enumerate(full_shape[global_dims:first_reduce])]
 
   # reduce loops
   idxs += [UOp(Ops.RANGE, dtypes.int, (sint_to_uop(0), sint_to_uop(g)), i)

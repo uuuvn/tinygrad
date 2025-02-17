@@ -1,11 +1,11 @@
 import os
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
+# os.environ["MKL_NUM_THREADS"] = "1"
+# os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# os.environ["OMP_NUM_THREADS"] = "1"
 import unittest
 import torch
-torch.set_num_threads(1)
+# torch.set_num_threads(1)
 import time
 import numpy as np
 np.set_printoptions(linewidth=160)

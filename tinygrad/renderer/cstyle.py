@@ -178,7 +178,6 @@ class ClangRenderer(CStyleLanguage):
   device = "CLANG"
   float4 = "(float4)"
   has_local = False
-  global_max = None
   infinity = "__builtin_inff()"
   nan = '__builtin_nanf("")'
   amx_tc = [TensorCore(dims=(sz,sz,1), threads=1, elements_per_thread=(sz,sz,sz*sz), dtype_in=dt, dtype_out=dt, swizzle=(None,((),(4,5,6,7,0,1,2,3))),
@@ -190,9 +189,11 @@ class ClangRenderer(CStyleLanguage):
   type_map = {dtypes.bool:"_Bool", dtypes.half:"__fp16"}
   code_for_op = {**({k:v for k,v in CStyleLanguage.code_for_op.items() if k not in [Ops.EXP2, Ops.SIN, Ops.LOG2]}),
                  Ops.SQRT: lambda x,dtype: f"__builtin_sqrt({x})" if dtype == dtypes.float64 else f"__builtin_sqrtf({x})"}
+  code_for_workitem = {"g": lambda x: f"global_{'xyz'[int(x)]}"}
   # LLVM legalizes double => half cast on systems that don't support it natively (like x86 cpus without AVX512-FP16) into a compiler-rt libcall.
   extra_matcher = PatternMatcher([(UPat.var("x", dtypes.float64).cast(dtypes.float16), lambda x: x.cast(dtypes.float32).cast(dtypes.float16))]) + \
     CStyleLanguage.extra_matcher
+  extra_args = [f"int global_{'xyz'[i]}" for i in range(3)]
 
   if sys.platform == 'win32':
     kernel_prefix = "__attribute__((ms_abi)) "
