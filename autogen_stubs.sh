@@ -326,10 +326,45 @@ generate_am() {
   fixup $BASE/am/mp_11_0.py
 
   clang2py -k cdefstum \
+    extra/hip_gpu_driver/kfd_pm4_headers_ai.h \
+    extra/hip_gpu_driver/navi10_enum.h \
+    extra/hip_gpu_driver/nvd.h \
+    extra/amdpci/headers/gc_10_3_0_offset.h \
+    extra/amdpci/headers/gc_10_3_0_sh_mask.h \
+    -o $BASE/am/gc_10_3_0.py
+  fixup $BASE/am/gc_10_3_0.py
+
+  clang2py -k cdefstum \
+    extra/hip_gpu_driver/kfd_pm4_headers_ai.h \
+    extra/hip_gpu_driver/soc21_enum.h \
+    extra/hip_gpu_driver/nvd.h \
     extra/amdpci/headers/gc_11_0_0_offset.h \
     extra/amdpci/headers/gc_11_0_0_sh_mask.h \
     -o $BASE/am/gc_11_0_0.py
   fixup $BASE/am/gc_11_0_0.py
+
+  clang2py -k cdefstum \
+    extra/hip_gpu_driver/kfd_pm4_headers_ai.h \
+    extra/hip_gpu_driver/soc24_enum.h \
+    extra/hip_gpu_driver/nvd.h \
+    extra/amdpci/headers/gc_12_0_0_offset.h \
+    extra/amdpci/headers/gc_12_0_0_sh_mask.h \
+    -o $BASE/am/gc_12_0_0.py
+  fixup $BASE/am/gc_12_0_0.py
+
+  clang2py -k cdefstum \
+    extra/hip_gpu_driver/sdma_registers.h \
+    extra/hip_gpu_driver/navi10_sdma_pkt_open.h \
+    --clang-args="-I/opt/rocm/include -x c++" \
+    -o $BASE/am/sdma_5_0_0.py
+  fixup $BASE/am/sdma_5_0_0.py
+
+  clang2py -k cdefstum \
+    extra/hip_gpu_driver/sdma_registers.h \
+    extra/hip_gpu_driver/sdma_v6_0_0_pkt_open.h \
+    --clang-args="-I/opt/rocm/include -x c++" \
+    -o $BASE/am/sdma_6_0_0.py
+  fixup $BASE/am/sdma_6_0_0.py
 
   clang2py -k cdefstum \
     extra/amdpci/headers/mmhub_3_0_0_offset.h \
@@ -344,10 +379,22 @@ generate_am() {
   fixup $BASE/am/mmhub_3_0_2.py
 
   clang2py -k cdefstum \
+    extra/amdpci/headers/nbio_2_3_offset.h \
+    extra/amdpci/headers/nbio_2_3_sh_mask.h \
+    -o $BASE/am/nbio_2_3_0.py
+  fixup $BASE/am/nbio_2_3_0.py
+
+  clang2py -k cdefstum \
     extra/amdpci/headers/nbio_4_3_0_offset.h \
     extra/amdpci/headers/nbio_4_3_0_sh_mask.h \
     -o $BASE/am/nbio_4_3_0.py
   fixup $BASE/am/nbio_4_3_0.py
+
+  clang2py -k cdefstum \
+    extra/amdpci/headers/nbif_6_3_1_offset.h \
+    extra/amdpci/headers/nbif_6_3_1_sh_mask.h \
+    -o $BASE/am/nbif_6_3_1.py
+  fixup $BASE/am/nbif_6_3_1.py
 
   clang2py -k cdefstum \
     extra/amdpci/headers/osssys_6_0_0_offset.h \
