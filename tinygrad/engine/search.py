@@ -99,7 +99,7 @@ def bufs_from_lin(lin:Kernel, allocate:bool=True) -> list[Buffer]:
     assert isinstance(dtype, (PtrDType, ImageDType))
     if buf_size == 0: buf_size = 1  # create a size 1 buffer if no cell is accessed in kernel. # TODO: remove from kernel input in this case.
     buf_dtype = dtype if isinstance(dtype, ImageDType) else dtype.base
-    rawbufs[k] = Buffer(lin.opts.device, buf_size, buf_dtype).allocate() if allocate else Buffer(lin.opts.device, buf_size, buf_dtype)
+    rawbufs[k] = Buffer(lin.device, buf_size, buf_dtype).allocate() if allocate else Buffer(lin.device, buf_size, buf_dtype)
   assert all(r is not None for r in rawbufs)
   return cast(list[Buffer], rawbufs)
 
@@ -144,7 +144,7 @@ def beam_search(lin:Kernel, rawbufs:list[Buffer], amt:int, allow_test_size=True,
   beam: list[tuple[Kernel, float]] = [(lin, float("inf"))]
   seen_libs = set()
 
-  default_parallel = multiprocessing.cpu_count() if lin.opts.device in {"CUDA", "AMD", "NV", "METAL", "HIP"} else 0
+  default_parallel = multiprocessing.cpu_count() if lin.device in {"CUDA", "AMD", "NV", "METAL", "HIP"} else 0
   if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
     beam_pool = multiprocessing.get_context("spawn").Pool(workers, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
     @atexit.register
@@ -158,7 +158,7 @@ def beam_search(lin:Kernel, rawbufs:list[Buffer], amt:int, allow_test_size=True,
     rawbufs = _ensure_buffer_alloc(rawbufs)
     var_vals: dict[Variable, int] = {k:int(k.vmax+k.vmin)//2 for k in lin.ast.variables()}
     exiting, st = False, time.perf_counter()
-    dev = Device[lin.opts.device]
+    dev = Device[lin.device]
     while not exiting:
       acted_lins: list[Kernel] = flatten([get_kernel_actions(lin, include_0=False).values() for lin,_ in beam])
       timed_lins: list[tuple[Kernel, float]] = []

@@ -36,11 +36,12 @@ class TensorCoreOptions:
     self.axes, self.axes_exist = tuple(axes), tuple(axes_exist)
 
 class Kernel:
-  def __init__(self, ast:UOp, opts:Optional[Renderer]=None):
+  def __init__(self, ast:UOp, opts:Optional[Renderer]=None, device:Optional[str]=None):
     assert ast.op is Ops.SINK, ast.op
     self.ast = ast
 
     self.opts = opts if opts is not None else Device[Device.DEFAULT].renderer
+    self.device = device if device is not None else self.opts.device
     # verify AST matches the spec
     if __debug__: type_verify(list(self.ast.toposort()), shape_spec)
 
@@ -85,7 +86,7 @@ class Kernel:
     ret = type(self).__new__(type(self))
 
     # base linearizer params
-    ret.opts, ret.ast = self.opts, self.ast
+    ret.opts, ret.device, ret.ast = self.opts, self.device, self.ast
 
     # things downstream of the AST
     ret.reduceops, ret.vars, ret.bufs = self.reduceops, self.vars, self.bufs
@@ -580,5 +581,5 @@ class Kernel:
     mem_bytes = sum(max(x.src[0].dtype.nbytes() for x in group)
       for _, group in itertools.groupby([x for x in self.ast.toposort() if x.op in GroupOp.Buffer and x.src[0].op is Ops.DEFINE_GLOBAL],
                         key=lambda x: (x.op, x.src[0].arg)))
-    return ProgramSpec(self.name if not name_override else name_override, src, self.opts.device, self.ast, self.uops, self.applied_opts, mem_bytes,
+    return ProgramSpec(self.name if not name_override else name_override, src, self.device, self.ast, self.uops, self.applied_opts, mem_bytes,
                        global_size=[1,1,1] if self.opts.has_local else None, local_size=[1,1,1] if self.opts.has_local else None)

@@ -13,13 +13,13 @@ from tinygrad.engine.schedule import ScheduleItem
 # **************** Program Creation ****************
 
 logkerns, logkerns_level = open(getenv("LOGKERNS", ""), "a") if getenv("LOGKERNS", "") else None, getenv("LOGKERNS_LEVEL", 1)
-def get_kernel(renderer:Renderer, ast:UOp) -> Kernel:
-  k = Kernel(ast, opts=renderer)
+def get_kernel(device:str, renderer:Renderer, ast:UOp) -> Kernel:
+  k = Kernel(ast, opts=renderer, device=device)
   if not NOOPT:
     if not k.apply_tensor_cores(getenv("TC", 1)): k.apply_opts(hand_coded_optimizations(k))
     if BEAM >= 1:
       from tinygrad.engine.search import beam_search, bufs_from_lin
-      kb = Kernel(ast, opts=renderer)
+      kb = Kernel(ast, opts=renderer, device=device)
       rawbufs = bufs_from_lin(kb, allocate=False)
       k = beam_search(kb, rawbufs, BEAM.value, bool(getenv("BEAM_ESTIMATE", 1)))
   if logkerns is not None: logkerns.writelines([f"{(k.ast, k.applied_opts)}\n"])
@@ -109,7 +109,7 @@ def get_runner(device:str, ast:UOp) -> CompiledRunner:
   if bret:=method_cache.get(bkey):
     method_cache[ckey] = ret = CompiledRunner(replace(bret.p, device=device), bret.lib)
   else:
-    prg: ProgramSpec = get_kernel(Device[device].renderer, ast).to_program()
+    prg: ProgramSpec = get_kernel(device, Device[device].renderer, ast).to_program()
     method_cache[ckey] = method_cache[bkey] = ret = CompiledRunner(replace(prg, device=device))
   return ret
 
