@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import cast
 import math, struct, sys
 from tinygrad.codegen.opt import tc
@@ -194,23 +195,23 @@ class LLVMRenderer(Renderer):
         kernel.append(cast(str, l))
     return tuple(local_args), self._render_fn(name, args, kernel, prefix)
 
-barrier = 'fence syncscope("workgroup") release\ntail call void @llvm.amdgcn.s.barrier()\nfence syncscope("workgroup") acquire\n'
-code_for_workitem = {"g": lambda x: f"tail call i32 @llvm.amdgcn.workgroup.id.{chr(120+int(x))}()",
-                     "l": lambda x: f"tail call i32 @llvm.amdgcn.workitem.id.{chr(120+int(x))}()"}
-# https://rocm.docs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPUUsage.html#llvm-ir-intrinsics
-llvm_intrinsics = {Ops.SQRT: "sqrt", Ops.LOG2: "log2", Ops.EXP2: "exp2"}
 class AMDLLVMRenderer(LLVMRenderer):
   device = "AMD"
   has_local = True
   shared_max = AMDRenderer.shared_max
   global_max = AMDRenderer.global_max
   abi = "amdgpu_kernel"
+  # https://rocm.docs.amd.com/projects/llvm-project/en/latest/LLVM/llvm/html/AMDGPUUsage.html#llvm-ir-intrinsics
+  llvm_intrinsics = {Ops.SQRT: "sqrt", Ops.LOG2: "log2", Ops.EXP2: "exp2"}
   code_for_op = {**LLVMRenderer.code_for_op, **{op: lambda: None for op in llvm_intrinsics}}
+  code_for_workitem = {"g": lambda x: f"tail call i32 @llvm.amdgcn.workgroup.id.{chr(120+int(x))}()",
+                       "l": lambda x: f"tail call i32 @llvm.amdgcn.workitem.id.{chr(120+int(x))}()"}
+  barrier = 'fence syncscope("workgroup") release\ntail call void @llvm.amdgcn.s.barrier()\nfence syncscope("workgroup") acquire\n'
   string_rewrite = PatternMatcher([
-    (UPat(Ops.SPECIAL, name="x"), lambda ctx, x: f"  {ctx[x]} = " + f"{ code_for_workitem[x.arg[0]](x.arg[-1])}; "),
+    (UPat(Ops.SPECIAL, name="x"), lambda ctx, x: f"  {ctx[x]} = " + f"{ AMDLLVMRenderer.code_for_workitem[x.arg[0]](x.arg[-1])}; "),
     (UPat(tuple(llvm_intrinsics), name="x"),
-    lambda ctx, x: f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.{llvm_intrinsics[x.op]}.{ldt(x.dtype.scalar())}({ldt(x.src[0].dtype)} {ctx[x.src[0]]})"),
-    (UPat(Ops.BARRIER), lambda ctx: barrier),
+    lambda ctx, x: f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.{AMDLLVMRenderer.llvm_intrinsics[x.op]}.{ldt(x.dtype.scalar())}({ldt(x.src[0].dtype)} {ctx[x.src[0]]})"), # noqa: E501
+    (UPat(Ops.BARRIER), lambda ctx: ctx.barrier),
   ]) + base_rewrite
   extra_matcher = LLVMRenderer.extra_matcher + PatternMatcher([
     (UPat(Ops.CAST, name="x", dtype=dtypes.half.vec(16), src=UPat.var("y", dtypes.half.vec(8))),
@@ -256,3 +257,22 @@ class AMDLLVMRenderer(LLVMRenderer):
             x.src[2]), (*x.arg,)) if x.src[0].dtype == dtypes.bfloat16.vec(8) else None)
       ])
   def __reduce__(self): return self.__class__, (self.arch,)
+
+vk_code_for_workitem = {"g": lambda x: f"tail call spir_func i32 @_Z12get_group_idj(i32 {int(x)})",
+                        "l": lambda x: f"tail call spir_func i32 @_Z12get_local_idj(i32 {int(x)})"}
+class VKLLVMRenderer(LLVMRenderer):
+  device = "VK"
+  has_local = True
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.SPECIAL, name="x"), lambda ctx, x: f"  {ctx[x]} = " + f"{ vk_code_for_workitem[x.arg[0]](x.arg[-1])}; "),
+  ]) + base_rewrite
+  extra_matcher = LLVMRenderer.extra_matcher + PatternMatcher([
+    (UPat(Ops.CAST, name="x", dtype=dtypes.half.vec(16), src=UPat.var("y", dtypes.half.vec(8))),
+      lambda x, y: UOp(Ops.VECTORIZE, dtypes.half.vec(16), tuple(y.gep(i // 2) if i % 2 == 0 else UOp.const(dtypes.half, 0.0) for i in range(16)))),
+    (UPat(Ops.CAST, name="x", dtype=dtypes.half.vec(8), src=UPat.var("y", dtypes.half.vec(16))),
+      lambda x, y: UOp(Ops.VECTORIZE, dtypes.half.vec(8), tuple(y.gep(i * 2) for i in range(8)))),
+  ])
+  def _render_footer(self, uops: list[UOp]) -> str:
+    fns = "\ndeclare spir_func i32 @_Z12get_local_idj(i32)\ndeclare spir_func i32 @_Z12get_group_idj(i32)\n\n"
+    attributes = ['"hlsl.shader"="compute"']
+    return fns + 'attributes #0 = { ' + ' '.join(attributes) + ' }'

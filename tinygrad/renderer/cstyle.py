@@ -270,6 +270,15 @@ class OpenCLRenderer(CStyleLanguage):
     if any(uop.dtype.base == dtypes.half for uop in uops): prefix = (["#pragma OPENCL EXTENSION cl_khr_fp16 : enable"] + (prefix or []))
     return super().render_kernel(function_name, kernel, bufs, uops, prefix)
 
+class VKCLRenderer(OpenCLRenderer):
+  device = "VK"
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
+    # NOTE: this assumes Ops.SPECIAL are sorted
+    local_dims = ([u.src[0] for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]+[UOp.const(dtypes.int32, 1)]*3)[:3]
+    assert all([u.op is Ops.CONST for u in local_dims]), f"vulkan doesn't support symbolic local dims: {local_dims=}"
+    self.kernel_typedef = f"__attribute__((reqd_work_group_size({', '.join([str(u.arg) for u in local_dims])}))) {VKCLRenderer.kernel_typedef}"
+    return super().render_kernel(function_name, kernel, bufs, uops, prefix)
+
 class IntelRenderer(OpenCLRenderer):
   device, suffix, kernel_typedef = "CL", "INTEL", "__attribute__((intel_reqd_sub_group_size(8)))\n" + "__kernel void"
   tensor_cores = tc.intel
