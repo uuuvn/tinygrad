@@ -48,6 +48,18 @@ generate_opencl() {
   python3 -c "import tinygrad.runtime.autogen.opencl"
 }
 
+generate_vulkan() {
+  clang2py -k cdefstum \
+    /usr/include/vulkan/vulkan_core.h \
+    /usr/include/vulkan/vk_platform.h \
+    /usr/include/vulkan/vulkan.h \
+    -l /usr/lib/x86_64-linux-gnu/libvulkan.so.1 -o $BASE/vulkan.py
+  fixup $BASE/vulkan.py
+  sed -i "s\import ctypes\import ctypes, ctypes.util\g" $BASE/vulkan.py
+  sed -i "s\ctypes.CDLL('/usr/lib/x86_64-linux-gnu/libvulkan.so.1')\ctypes.CDLL(ctypes.util.find_library('vulkan'))\g" $BASE/vulkan.py
+  python3 -c "import tinygrad.runtime.autogen.vulkan"
+}
+
 generate_hip() {
   clang2py /opt/rocm/include/hip/hip_ext.h /opt/rocm/include/hip/hiprtc.h \
   /opt/rocm/include/hip/hip_runtime_api.h /opt/rocm/include/hip/driver_types.h \
@@ -452,6 +464,7 @@ generate_libusb() {
 }
 
 if [ "$1" == "opencl" ]; then generate_opencl
+elif [ "$1" == "vulkan" ]; then generate_vulkan
 elif [ "$1" == "hip" ]; then generate_hip
 elif [ "$1" == "comgr" ]; then generate_comgr
 elif [ "$1" == "cuda" ]; then generate_cuda
