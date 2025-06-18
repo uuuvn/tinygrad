@@ -1,0 +1,141 @@
+class VKProgram:
+  MAX_BUFFERS = 64
+
+  def __init__(self, dev:VKDevice, name:str, lib:bytes):
+    self.dev, self.name, self.lib = dev, name, lib
+
+    shader_info = vk.VkShaderModuleCreateInfo(
+      sType=vk.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      pCode=(ctypes.c_uint32 * (len(lib)//4)).from_buffer_copy(lib),
+      codeSize=len(lib),
+    )
+    self.shader = vk.VkShaderModule()
+    checkz(vk.vkCreateShaderModule(dev.ldev, ctypes.byref(shader_info), None, ctypes.byref(self.shader)))
+
+    bindings = [
+      vk.VkDescriptorSetLayoutBinding(
+        binding=i,
+        descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        descriptorCount=1,
+        stageFlags=vk.VK_SHADER_STAGE_COMPUTE_BIT
+      ) for i in range(VKProgram.MAX_BUFFERS)
+    ]
+
+    layout_info = vk.VkDescriptorSetLayoutCreateInfo(
+      sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      bindingCount=len(bindings),
+      pBindings=(vk.VkDescriptorSetLayoutBinding * len(bindings))(*bindings)
+    )
+
+    self.desc_layout = vk.VkDescriptorSetLayout()
+    checkz(vk.vkCreateDescriptorSetLayout(dev.ldev, ctypes.byref(layout_info), None, ctypes.byref(self.desc_layout)))
+
+    pipeline_layout_info = vk.VkPipelineLayoutCreateInfo(
+      sType=vk.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      setLayoutCount=1,
+      pSetLayouts=ctypes.pointer(self.desc_layout)
+    )
+
+    self.pipeline_layout = vk.VkPipelineLayout()
+    checkz(vk.vkCreatePipelineLayout(dev.ldev, ctypes.byref(pipeline_layout_info), None, ctypes.byref(self.pipeline_layout)))
+
+    stage_info = vk.VkPipelineShaderStageCreateInfo(
+      sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      stage=vk.VK_SHADER_STAGE_COMPUTE_BIT,
+      module=self.shader,
+      pName=vk.char_pointer_cast(name)
+    )
+
+    pipeline_info = vk.VkComputePipelineCreateInfo(
+      sType=vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      stage=stage_info,
+      layout=self.pipeline_layout
+    )
+
+    self.pipeline = vk.VkPipeline()
+    checkz(vk.vkCreateComputePipelines(dev.ldev, None, 1, ctypes.byref(pipeline_info), None, ctypes.byref(self.pipeline)))
+
+    pool_size = vk.VkDescriptorPoolSize(
+      type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+      descriptorCount=16*VKProgram.MAX_BUFFERS
+    )
+
+    pool_info = vk.VkDescriptorPoolCreateInfo(
+      sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      flags=vk.VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+      maxSets=16,
+      poolSizeCount=1,
+      pPoolSizes=ctypes.pointer(pool_size)
+    )
+
+    self.desc_pool = vk.VkDescriptorPool()
+    checkz(vk.vkCreateDescriptorPool(dev.ldev, ctypes.byref(pool_info), None, ctypes.byref(self.desc_pool)))
+
+  def __del__(self):
+    self.dev.synchronize()
+    vk.vkDestroyDescriptorPool(self.dev.ldev, self.desc_pool, None)
+    vk.vkDestroyPipeline(self.dev.ldev, self.pipeline, None)
+    vk.vkDestroyPipelineLayout(self.dev.ldev, self.pipeline_layout, None)
+    vk.vkDestroyDescriptorSetLayout(self.dev.ldev, self.desc_layout, None)
+    vk.vkDestroyShaderModule(self.dev.ldev, self.shader, None)
+
+  def __call__(self, *bufs:VKBuf, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(), wait=False):
+    ds_alloc_info = vk.VkDescriptorSetAllocateInfo(
+      sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      descriptorPool=self.desc_pool,
+      descriptorSetCount=1,
+      pSetLayouts=ctypes.pointer(self.desc_layout)
+    )
+
+    checkz(vk.vkAllocateDescriptorSets(self.dev.ldev, ctypes.byref(ds_alloc_info), ctypes.byref(desc_set:=vk.VkDescriptorSet())))
+
+    writes = [
+      vk.VkWriteDescriptorSet(
+        sType=vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        dstSet=desc_set,
+        dstBinding=i,
+        dstArrayElement=0,
+        descriptorCount=1,
+        descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        pBufferInfo=ctypes.pointer(vk.VkDescriptorBufferInfo(buffer=buf.buf, offset=0, range=vk.VK_WHOLE_SIZE))
+      ) for i, buf in enumerate(bufs)
+    ]
+
+    vk.vkUpdateDescriptorSets(self.dev.ldev, len(writes), (vk.VkWriteDescriptorSet * len(writes))(*writes), 0, None)
+
+    cb_alloc_info = vk.VkCommandBufferAllocateInfo(
+      sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      commandPool=self.dev.cq_pool,
+      level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      commandBufferCount=1
+    )
+
+    checkz(vk.vkAllocateCommandBuffers(self.dev.ldev, ctypes.byref(cb_alloc_info), ctypes.byref(cmd_buf:=vk.VkCommandBuffer())))
+
+    begin_info = vk.VkCommandBufferBeginInfo(
+      sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
+    )
+
+    checkz(vk.vkBeginCommandBuffer(cmd_buf, ctypes.byref(begin_info)))
+
+    vk.vkCmdBindPipeline(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline)
+    vk.vkCmdBindDescriptorSets(cmd_buf, vk.VK_PIPELINE_BIND_POINT_COMPUTE, self.pipeline_layout, 0, 1, ctypes.pointer(desc_set), 0, None)
+
+    if vals:
+      vals_data = (ctypes.c_uint32 * len(vals))(*vals)
+      vk.vkCmdPushConstants(cmd_buf, self.pipeline_layout, vk.VK_SHADER_STAGE_COMPUTE_BIT, 0, len(vals) * 4, ctypes.cast(vals_data, ctypes.c_void_p))
+
+    vk.vkCmdDispatch(cmd_buf, *global_size)
+
+    checkz(vk.vkEndCommandBuffer(cmd_buf))
+
+    submit_info = vk.VkSubmitInfo(
+      sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      commandBufferCount=1,
+      pCommandBuffers=ctypes.pointer(cmd_buf)
+    )
+
+    checkz(vk.vkQueueSubmit(self.dev.cq, 1, ctypes.byref(submit_info), None))
+
+    if wait: self.dev.synchronize()
