@@ -18,6 +18,7 @@ ARCH_X86 = any(x in platform.processor() for x in ("Intel", "i386", "x86_64"))
 if WIN: os.system("")
 
 def dedup(x:Iterable[T]): return list(dict.fromkeys(x))   # retains list order
+def fnone(items: Iterable[T|None]) -> list[T]: return [i for i in items if i is not None]
 def argfix(*x):
   if x and x[0].__class__ in (tuple, list):
     if len(x) != 1: raise ValueError(f"bad arg {x}")
