@@ -10,6 +10,7 @@ from tinygrad.device import Compiled, ProfileEvent, BufferSpec, CPUProgram, PROF
 from tinygrad.helpers import getenv, to_mv, round_up, data64_le, all_same, flatten, DEBUG, OSX
 from tinygrad.renderer.cstyle import AMDRenderer
 from tinygrad.renderer.llvmir import AMDLLVMRenderer
+from tinygrad.renderer.rdna import RDNARenderer, RDNACompiler
 from tinygrad.runtime.autogen import kfd, hsa, libc, pci, vfio, sqtt
 from tinygrad.runtime.autogen.am import am
 from tinygrad.runtime.support.compiler_amd import HIPCompiler, AMDLLVMCompiler
@@ -904,9 +905,11 @@ class AMDDevice(HCQCompiled):
     max_copy_size = 0x40000000 if self.dev_iface.ip_versions[am.SDMA0_HWIP][0] >= 5 else 0x400000
     self.sdma_queue = self.create_queue(kfd.KFD_IOC_QUEUE_TYPE_SDMA, 0x200 if self.is_usb() else 0x800000)
 
-    super().__init__(device, AMDAllocator(self), AMDLLVMRenderer(self.arch) if getenv("AMD_LLVM", 0) else AMDRenderer(self.arch),
-                     AMDLLVMCompiler(self.arch) if getenv("AMD_LLVM", 0) else HIPCompiler(self.arch), functools.partial(AMDProgram, self),
-                     AMDSignal, functools.partial(AMDComputeQueue, self), functools.partial(AMDCopyQueue, self, max_copy_size=max_copy_size),
+    renderer = RDNARenderer(self.arch) if getenv("AMD_RDNA", 1) else (AMDLLVMRenderer(self.arch) if getenv("AMD_LLVM", 0) else AMDRenderer(self.arch))
+    compiler = RDNACompiler(self.arch) if getenv("AMD_RDNA", 1) else (AMDLLVMCompiler(self.arch) if getenv("AMD_LLVM", 0) else HIPCompiler(self.arch))
+
+    super().__init__(device, AMDAllocator(self), renderer, compiler, functools.partial(AMDProgram, self), AMDSignal,
+                     functools.partial(AMDComputeQueue, self), functools.partial(AMDCopyQueue, self, max_copy_size=max_copy_size),
                      kernargs_size=(8 << 10) if self.is_usb() else (16 << 20), sigalloc_size=0x100 if self.is_usb() else 0x1000)
 
     # Scratch setup
