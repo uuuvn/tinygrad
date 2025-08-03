@@ -113,6 +113,18 @@ base_rewrite = PatternMatcher([
   (UPat(Ops.BARRIER), lambda ctx: "")
 ])
 
+dbg = '''\
+!0 = !DIFile(filename: "kernel.c", directory: "/tinygrad/kernel")
+!1 = distinct !DICompileUnit(language: DW_LANG_C11, file: !0, emissionKind: FullDebug)
+!2 = distinct !DISubprogram(scope: !0, type: !DISubroutineType(types: !{}), unit: !1)
+
+!3 = !{i32 7, !"Dwarf Version", i32 5}
+!4 = !{i32 2, !"Debug Info Version", i32 3}
+
+!llvm.dbg.cu = !{!1}
+!llvm.module.flags = !{!3, !4}
+'''
+
 class LLVMRenderer(Renderer):
   device = "LLVM"
   abi = 'win64cc' if sys.platform == 'win32' else None
@@ -137,13 +149,13 @@ class LLVMRenderer(Renderer):
     (UPat(Ops.CAST, dtypes.bfloat16, UPat.var("x")),lambda x: x.cast(dtypes.float).cast(dtypes.bfloat16) if x.dtype!=dtypes.float else None),
   ])
 
-  def render(self, uops: list[UOp]) -> str: return "\n".join((k:=self._render_kernel(uops))[0] + (k[1], self._render_footer(uops)))
+  def render(self, uops: list[UOp]) -> str: return "\n".join((dbg,) + (k:=self._render_kernel(uops))[0] + (k[1], self._render_footer(uops)))
   def _render_footer(self, uops: list[UOp]) -> str: return 'attributes #0 = { alwaysinline nounwind "no-builtins" "no-trapping-math"="true" }'
   def _render_fn(self, name:str, args:list[tuple[str,DType]], kernel:list[str], prefix:list[str]|None=None) -> str:
     # NOTE: CPUAllocator promises 0x20 alignment
     sargs = ", ".join([f"{ldt(dt)}{' noalias align 32' if isinstance(dt, PtrDType) else ''} {name}" for name,dt in args])
     sprefix = "".join([f" {x}" for x in (prefix or []) + [self.abi] if x is not None])
-    return "\n".join([f"define{sprefix} void @{name}({sargs}) #0", "{"] + kernel + ["  ret void\n}"])
+    return "\n".join([f"define{sprefix} void @{name}({sargs}) #0 !dbg !2", "{"] + kernel + ["}"])
   def _render_kernel(self, uops: list[UOp], prefix:list[str]|None=None) -> tuple[tuple[str, ...], str]:
     r: dict[UOp, str] = {}
     args: list[tuple[str, DType]] = []
@@ -160,10 +172,13 @@ class LLVMRenderer(Renderer):
                      f"  {r[u]}_ptr_amx{i} = ptrtoint {ldt(dtype.ptr())} {r[u]}_amx{i} to i64"]
 
     name = "test"
-    for u in uops:
+    for i,u in enumerate(uops):
+      def kk(ll:str):
+        kernel.extend([f"  {l.strip()}{f', !dbg !DILocation(line: {i}, scope: !2)' if not l.endswith(':') else ''}" for l in ll.splitlines()])
       if u.op is Ops.NOOP: continue
       if u.op is Ops.SINK:
         if u.arg is not None: name = u.arg.function_name
+        kk("ret void")
         continue
       if u.op in (Ops.DEFINE_GLOBAL, Ops.DEFINE_VAR):
         r[u] = f"%data{u.arg}" if u.op is Ops.DEFINE_GLOBAL else f"%{u.arg[0]}"
@@ -172,10 +187,10 @@ class LLVMRenderer(Renderer):
         r[u] = f"%{'local' if u.op is Ops.DEFINE_LOCAL else 'reg'}_{str(u.arg).replace('(', '').replace(')', '').replace(',', '_').replace(' ', '')}"
         assert isinstance(u.dtype, PtrDType)
         if self.device == "LLVM" or u.op is Ops.DEFINE_REG:
-          kernel.append(f"  {r[u]} = alloca [{u.dtype.size} x {ldt(u.dtype.base)}]")
+          kk(f"  {r[u]} = alloca [{u.dtype.size} x {ldt(u.dtype.base)}]")
         else:
           local_args.append(f"@{r[u][1:]} = internal unnamed_addr addrspace(3) global [{u.dtype.size} x {ldt(u.dtype)}] undef, align 16")
-          kernel.append(f"  {r[u]} = addrspacecast [{u.dtype.size} x {ldt(u.dtype)}] addrspace(3)* @{r[u][1:]} to [{u.dtype.size} x {ldt(u.dtype)}]*")
+          kk(f"  {r[u]} = addrspacecast [{u.dtype.size} x {ldt(u.dtype)}] addrspace(3)* @{r[u][1:]} to [{u.dtype.size} x {ldt(u.dtype)}]*")
       elif u.op is Ops.CONST: r[u] = lconst(u.arg, u.dtype)
       elif u.op is Ops.CAST and (ldt(u.dtype) == ldt(u.src[0].dtype) or isinstance(u.dtype, PtrDType)):
         r[u] = r[u.src[0]] # cast from signed to unsigned of the same size is a noop, or pointer cast
@@ -188,7 +203,7 @@ class LLVMRenderer(Renderer):
         # do the rendering of the llvm ir code
         if (l:=self.string_rewrite.rewrite(u, ctx=r)) is None:
           raise RuntimeError(f"failed to render {u.op} with {u.dtype} srcs {[x.dtype for x in u.src]}")
-        kernel.append(cast(str, l))
+        kk(cast(str, l))
     return tuple(local_args), self._render_fn(name, args, kernel, prefix)
 
 barrier = 'fence syncscope("workgroup") release\ntail call void @llvm.amdgcn.s.barrier()\nfence syncscope("workgroup") acquire\n'
