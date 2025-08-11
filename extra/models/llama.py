@@ -34,23 +34,28 @@ def repeat_kv(x:Tensor, n_rep:int) -> Tensor:
   return x.repeat((1, 1, 1, n_rep)).reshape(bs, seqlen, n_kv_heads * n_rep, head_dim)
 
 class Attention:
-  def __init__(self, dim, n_heads, n_kv_heads=None, max_context=0, linear=nn.Linear, qk_norm:float|None=None):
+  def __init__(self, dim, n_heads, n_kv_heads=None, max_context=0, linear=nn.Linear, qk_norm:float|None=None, fused_qkv:bool=False):
     self.n_heads = n_heads
     self.n_kv_heads = n_kv_heads if n_kv_heads is not None else n_heads # n_kv_heads != n_heads implies MQA [arxiv/2307.09288, A.2.1]
     self.head_dim = dim // n_heads
     self.n_rep = self.n_heads // self.n_kv_heads
     self.max_context = max_context
+    self.fused_qkv = fused_qkv
 
-    self.wq = linear(dim, self.n_heads * self.head_dim, bias=False)
-    self.wk = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-    self.wv = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+    if not fused_qkv:
+      self.wq = linear(dim, self.n_heads * self.head_dim, bias=False)
+      self.wk = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+      self.wv = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+    else:
+      self.wqkv = linear(dim, self.n_heads * self.head_dim + self.n_kv_heads * self.head_dim * 2, bias=False)
+
     self.wo = linear(self.n_heads * self.head_dim, dim, bias=False)
 
     self.q_norm = nn.RMSNorm(dim, qk_norm) if qk_norm is not None else None
     self.k_norm = nn.RMSNorm(dim, qk_norm) if qk_norm is not None else None
 
   def __call__(self, x:Tensor, start_pos:Union[Variable,int], freqs_cis:Tensor, mask:Optional[Tensor]=None) -> Tensor:
-    if getenv("WQKV"):
+    if self.fused_qkv or getenv("WQKV"):
       if not hasattr(self, 'wqkv'): self.wqkv = Tensor.cat(self.wq.weight, self.wk.weight, self.wv.weight)
       xqkv = x @ self.wqkv.T
       xq, xk, xv = xqkv.split([self.wq.weight.shape[0], self.wk.weight.shape[0], self.wv.weight.shape[0]], dim=2)
@@ -105,8 +110,8 @@ class FeedForward:
 
 class TransformerBlock:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, max_context:int, linear=nn.Linear,
-               feed_forward=FeedForward, qk_norm=None):
-    self.attention = Attention(dim, n_heads, n_kv_heads, max_context, linear, qk_norm)
+               feed_forward=FeedForward, qk_norm=None, fused_qkv:bool=False):
+    self.attention = Attention(dim, n_heads, n_kv_heads, max_context, linear, qk_norm, fused_qkv)
     self.feed_forward = feed_forward(dim, hidden_dim, linear)
     self.attention_norm = nn.RMSNorm(dim, norm_eps)
     self.ffn_norm = nn.RMSNorm(dim, norm_eps)
@@ -168,9 +173,10 @@ def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):
 
 class Transformer:
   def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_layers:int, norm_eps:float, vocab_size, linear=nn.Linear, embedding=nn.Embedding,
-               n_kv_heads=None, rope_theta=10000, max_context=1024, jit=True, feed_forward=FeedForward, qk_norm=None, disable_kv_cache=False):
+               n_kv_heads=None, rope_theta=10000, max_context=1024, jit=True, feed_forward=FeedForward, qk_norm=None, disable_kv_cache=False,
+               fused_qkv:bool=False):
     self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, 0 if disable_kv_cache else max_context,
-                                    linear, feed_forward=feed_forward, qk_norm=qk_norm) for _ in range(n_layers)]
+                                    linear, feed_forward=feed_forward, qk_norm=qk_norm, fused_qkv=fused_qkf) for _ in range(n_layers)]
     self.norm = nn.RMSNorm(dim, norm_eps)
     self.tok_embeddings = embedding(vocab_size, dim)
     self.output = nn.Linear(dim, vocab_size, bias=False) if embedding == nn.Embedding else linear(dim, vocab_size, bias=False)

@@ -163,7 +163,7 @@ MODEL_PARAMS = {
     "files": 191
   },
 }
-def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dtype=dtypes.float16, device=None, max_context=8192, load_weights=True):
+def build_transformer(model_path: Path, model_size="8B", quantize=None, lora_path: Path|None=None, scale_dtype=dtypes.float16, device=None, max_context=8192, load_weights=True):
   # build model
   if quantize == "int8": linear, embedding, quantize_embeds = Int8Linear, Int8Embedding, True
   elif quantize == "nf4": linear, embedding, quantize_embeds = NF4Linear(64), nn.Embedding, False
@@ -184,7 +184,15 @@ def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dt
       weights = convert_from_huggingface(weights, MODEL_PARAMS[model_size]["args"]["n_layers"], MODEL_PARAMS[model_size]["args"]["n_heads"], MODEL_PARAMS[model_size]["args"]["n_kv_heads"])
     elif "token_embd.weight" in weights:
       weights = convert_from_gguf(weights, MODEL_PARAMS[model_size]["args"]["n_layers"])
+    if "output.weight" not in weights and "tok_embeddings.weight" in weights: weights["output.weight"] = weights["tok_embeddings.weight"]
     weights = fix_bf16(weights)
+
+    if lora_path is not None:
+      if lora_path.is_dir(): lora = load(str(lora_path / "adapter_model.safetensors"))
+      else: lora = load(str(lora_path))
+      lora = fix_bf16(lora)
+    else:
+      lora = None
 
     with Context(BEAM=0):
       # quantize
@@ -207,6 +215,16 @@ def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dt
 
       # replace weights in model
       load_state_dict(model, weights, strict=False, consume=True)
+
+      if lora is not None:
+        # inject lora
+        for i,layer in enumerate(model.layers):
+          layer.attention.wq = wq = nn.LoRALinear(layer.attention.wq, 8, 16)
+          wq.lora_a.replace(lora[f"base_model.model.model.layers.{i}.self_attn.q_proj.lora_A.weight"].to(wq.lora_a.device).cast(wq.lora_a.dtype)).realize()
+          wq.lora_b.replace(lora[f"base_model.model.model.layers.{i}.self_attn.q_proj.lora_B.weight"].to(wq.lora_b.device).cast(wq.lora_b.dtype)).realize()
+          layer.attention.wv = wv = nn.LoRALinear(layer.attention.wv, 8, 16)
+          wv.lora_a.replace(lora[f"base_model.model.model.layers.{i}.self_attn.v_proj.lora_A.weight"].to(wv.lora_a.device).cast(wv.lora_a.dtype)).realize()
+          wv.lora_b.replace(lora[f"base_model.model.model.layers.{i}.self_attn.v_proj.lora_B.weight"].to(wv.lora_b.device).cast(wv.lora_b.dtype)).realize()
   return model
 
 # default settings
@@ -243,6 +261,7 @@ if __name__ == "__main__":
   parser.add_argument("--size", choices=["1B", "8B", "70B", "405B"], default="1B", help="Model size")
   parser.add_argument("--shard", type=int, default=1, help="Shard the model across multiple devices")
   parser.add_argument("--quantize", choices=["int8", "nf4", "float16"], help="Quantization method")
+  parser.add_argument("--lora", type=Path, help="LoRA path")
   parser.add_argument("--no_api", action="store_true", help="Disable the api and run a cli test interface")
   parser.add_argument("--host", type=str, default="0.0.0.0", help="Web server bind address")
   parser.add_argument("--port", type=int, default=7776, help="Web server port")
@@ -287,7 +306,7 @@ if __name__ == "__main__":
     return encode_role(role) + tokenizer.encode(content.strip()) + [tokenizer.special_tokens["<|eot_id|>"]]
 
   device = tuple(f"{Device.DEFAULT}:{i}" for i in range(args.shard)) if args.shard > 1 else Device.DEFAULT
-  model = build_transformer(args.model, model_size=args.size, quantize=args.quantize, device=device)
+  model = build_transformer(args.model, model_size=args.size, quantize=args.quantize, lora_path=args.lora, device=device)
   param_bytes = sum(x.uop.size * x.dtype.itemsize for x in get_parameters(model))
 
   if not args.no_api and not args.benchmark:

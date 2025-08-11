@@ -127,3 +127,17 @@ class Conv2dRetinaNet(nn.Conv2d):
   def __call__(self, x:Tensor) -> Tensor:
     return x.conv2d(self.weight.cast(dtypes.default_float), self.bias.cast(dtypes.default_float) if self.bias is not None else None,
                     groups=self.groups, stride=self.stride, dilation=self.dilation, padding=self.padding)
+
+class LoRALinear(nn.Linear):
+  def __init__(self, inner:Linear, lora_rank:int, lora_alpha:int):
+    self.weight, self.bias = inner.weight, inner.bias
+
+    out_features, in_features = inner.weight.shape
+    bound = 1 / math.sqrt(in_features)
+
+    self.lora_a = Tensor.uniform(lora_rank, in_features, low=-bound, high=bound, dtype=inner.weight.dtype)
+    self.lora_b = Tensor.zeros(out_features, lora_rank, dtype=inner.weight.dtype)
+    self.lora_scale = lora_alpha / lora_rank
+
+  def __call__(self, x:Tensor) -> Tensor:
+    return x.linear(self.weight.transpose(), self.bias) + x.linear(self.lora_a.transpose()).linear(self.lora_b.transpose()).mul(self.lora_scale)
