@@ -191,7 +191,7 @@ def load(fn:str):
 
 class LLaMa:
   @staticmethod
-  def build(model_path, tokenizer_path, model_gen="1", model_size="7B", quantize=None, device=None):
+  def build(model_path, tokenizer_path, model_gen="1", model_size="7B", quantize=None, lora_path=None, device=None):
     params = MODEL_PARAMS[model_gen][model_size]
     tokenizer = MODEL_PARAMS[model_gen]['tokenizer'](model_file=str(tokenizer_path))
     assert tokenizer.vocab_size() == params["args"]["vocab_size"], f"{tokenizer.vocab_size()=} not equal to {params['args']['vocab_size']}"
@@ -216,6 +216,13 @@ class LLaMa:
         weights = convert_from_huggingface(weights, params["args"]["n_layers"], params["args"]["n_heads"], params["args"].get("n_kv_heads", params["args"]["n_heads"]))
 
       weights = fix_bf16(weights)
+
+      if lora_path is not None:
+        if lora_path.is_dir(): lora = load(str(lora_path / "adapter_model.safetensors"))
+        else: lora = load(str(lora_path))
+        lora = fix_bf16(lora)
+      else:
+        lora = None
 
       # prevent tracking model weights
       # this is a part of a larger problem with BUFFER UOps and gc in TRACK_MATCH_STATS=2
@@ -243,6 +250,18 @@ class LLaMa:
 
         # replace weights in model
         load_state_dict(model, weights, strict=False, consume=True)
+
+        if lora is not None:
+          # Inject LoRA
+          for i,layer in enumerate(model.layers):
+            # qkv_proj share lora_a (reference model uses fused qkv projection and, as far as i can tell from the messy code, one lora on it)
+            layer.attention.wq = nn.LoRALinear(layer.attention.wq, 16, 32)
+            layer.attention.wk = nn.LoRALinear(layer.attention.wk, 16, 32, lora_a=layer.attention.wq.lora_a)
+            layer.attention.wv = nn.LoRALinear(layer.attention.wv, 16, 32, lora_a=layer.attention.wq.lora_a)
+            # o_proj is on it's own
+            layer.attention.wo = nn.LoRALinear(layer.attention.wo, 16, 32)
+
+          load_state_dict(model, lora, strict=False, consume=True)
 
     return LLaMa(model, tokenizer)
 
@@ -343,6 +362,7 @@ if __name__ == "__main__":
   parser.add_argument("--size", type=str, default=None, help=f"""Size of model to use {", ".join([f"{list(v.keys())} for gen '{k}'" for k, v in MODEL_PARAMS.items()])}""")
   parser.add_argument("--quantize", type=str, default=None, help="Quantize the weights to int8 or nf4 in memory")
   parser.add_argument("--model", type=Path, default=None, help="Folder with the original weights to load, or single .index.json, .safetensors or .bin file")
+  parser.add_argument("--lora", type=Path, default=None, help="LoRA weights")
   parser.add_argument("--shard", type=int, default=1, help="number of devices to load the weights to")
 
   args = parser.parse_args()
@@ -444,7 +464,7 @@ After you are done speaking, output [EOS]. You are not Chad.
   TOKENIZER_PATH = (MODEL_PATH if MODEL_PATH.is_dir() else MODEL_PATH.parent) / "tokenizer.model"
   print(f"using LLaMA{LLAMA_SUFFIX}-{args.size} model")
   device = tuple(f"{Device.DEFAULT}:{i}" for i in range(args.shard)) if args.shard > 1 else Device.DEFAULT
-  llama = LLaMa.build(MODEL_PATH, TOKENIZER_PATH, model_gen=args.gen, model_size=args.size, quantize=args.quantize, device=device)
+  llama = LLaMa.build(MODEL_PATH, TOKENIZER_PATH, model_gen=args.gen, model_size=args.size, quantize=args.quantize, lora_path=args.lora, device=device)
   param_bytes = sum(x.uop.size * x.dtype.itemsize for x in get_parameters(llama.model))
 
   outputted = pre_prompt if chatbot else args.prompt

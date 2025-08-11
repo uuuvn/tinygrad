@@ -177,6 +177,20 @@ class Linear:
 
   def __call__(self, x:Tensor) -> Tensor: return x.linear(self.weight.transpose(), self.bias)
 
+class LoRALinear(Linear):
+  def __init__(self, inner:Linear, lora_rank:int, lora_alpha:int, lora_a:Tensor|None=None):
+    self.weight, self.bias = inner.weight, inner.bias
+
+    out_features, in_features = inner.weight.shape
+    bound = 1 / math.sqrt(in_features)
+
+    self.lora_a = Tensor.uniform(lora_rank, in_features, low=-bound, high=bound, dtype=inner.weight.dtype) if lora_a is None else lora_a
+    self.lora_b = Tensor.zeros(out_features, lora_rank, dtype=inner.weight.dtype)
+    self.lora_scale = lora_alpha / lora_rank
+
+  def __call__(self, x:Tensor) -> Tensor:
+    return x.linear(self.weight.transpose(), self.bias) + x.linear(self.lora_a.transpose()).linear(self.lora_b.transpose()).mul(self.lora_scale)
+
 class GroupNorm:
   """
   Applies Group Normalization over a mini-batch of inputs.

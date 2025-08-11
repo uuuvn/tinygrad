@@ -3,8 +3,8 @@ from pathlib import Path
 import multiprocessing
 
 from tinygrad import Device, GlobalCounters, Tensor, TinyJit, dtypes
-from tinygrad.helpers import getenv, BEAM, WINO, round_up, diskcache_clear, FUSE_CONV_BW, Profiling
-from tinygrad.nn.state import get_parameters, get_state_dict, safe_load, safe_save
+from tinygrad.helpers import getenv, BEAM, WINO, round_up, dedup, prod, diskcache_clear, FUSE_CONV_BW, Profiling
+from tinygrad.nn.state import get_parameters, get_state_dict, load_state_dict, safe_load, safe_save
 from tinygrad.nn.optim import LAMB, LARS, SGD, OptimizerGroup, Adam, AdamW
 
 from extra.lr_scheduler import LRSchedulerGroup
@@ -1462,6 +1462,104 @@ def train_llama3():
           fn = f"{ckpt_dir}/llama3.safe"
           safe_save(get_state_dict(model), fn)
         break
+
+def train_llama_lora():
+  import itertools, pandas as pd
+  import tinygrad.nn as nn
+  from extra.models.llama import Transformer, convert_from_huggingface
+  from sentencepiece import SentencePieceProcessor
+  from examples.llama import MODEL_PARAMS
+  from examples.mlperf.lr_schedulers import CosineAnnealingLRWithWarmup
+
+  GEN, MODEL = "tiny", "1B"
+  PARAMS = MODEL_PARAMS[GEN][MODEL]["args"]
+
+  GPUS   = getenv("GPUS", 1)
+  BS     = getenv("BS", GPUS)
+  SEQLEN = getenv("SEQLEN", 4096)
+
+  opt_gradient_clip_norm = 0.3
+
+  # Tokenizer
+
+  tokenizer = SentencePieceProcessor(model_file="./weights/TinyLlama-1.1B-v1.0/tokenizer.model")
+  assert tokenizer.vocab_size() == PARAMS["vocab_size"], f"{tokenizer.vocab_size()=} not equal to {PARAMS['vocab_size']}"
+
+  # Create and load the model
+  model = Transformer(**PARAMS, max_context=8192, jit=False, disable_kv_cache=True)
+  assert SEQLEN <= model.max_context
+
+  weights = safe_load("./weights/TinyLlama-1.1B-v1.0/model.safetensors")
+  weights = convert_from_huggingface(weights, PARAMS["n_layers"], PARAMS["n_heads"], PARAMS["n_kv_heads"])
+  # weights = {k:v.cast(dtypes.float16) for k,v in weights.items()}
+
+  # for k,v in get_state_dict(model).items(): v.replace(v.cast(dtypes.float16))
+  load_state_dict(model, weights, strict=False, consume=True)
+  
+  # # Inject LoRA
+  # for i,layer in enumerate(model.layers):
+  #   # qkv_proj share lora_a (reference model uses fused qkv projection and, this is a guess, one lora on it)
+  #   layer.attention.wq = nn.LoRALinear(layer.attention.wq, 16, 32)
+  #   layer.attention.wk = nn.LoRALinear(layer.attention.wk, 16, 32) #, lora_a=layer.attention.wq.lora_a)
+  #   layer.attention.wv = nn.LoRALinear(layer.attention.wv, 16, 32) #, lora_a=layer.attention.wq.lora_a)
+  #   # o_proj is on it's own
+  #   layer.attention.wo = nn.LoRALinear(layer.attention.wo, 16, 32)
+
+  if GPUS > 1:
+    for v in dedup(get_parameters(model)):
+      v.shard_(tuple(f"{Device.DEFAULT}:{i}" for i in range(GPUS)), None)
+
+  # Create optimizer and scheduler (only lora layers are trainable)
+  # trainable_params = dedup([v for k,v in get_state_dict(model).items() if "lora" in k])
+
+  # optim = AdamW(trainable_params, lr=0.0, weight_decay=0.0001)
+  # sched = CosineAnnealingLRWithWarmup(optim, base_lr=1e-4, end_lr=0.0, warmup_steps=64, decay_steps=960)
+
+  # Training function
+
+  @TinyJit
+  @Tensor.train()
+  def train_step(model:Transformer, batch:Tensor):
+    if GPUS > 1: batch.shard_(tuple(f"{Device.DEFAULT}:{i}" for i in range(GPUS)), 0)
+    # optim.zero_grad()
+
+    logits:Tensor = model(batch[:, :-1], start_pos=0, temperature=math.nan)
+    loss = logits.sparse_categorical_crossentropy(batch[:, 1:])
+    loss.backward()
+
+    # total_norm = Tensor(0.0, dtype=dtypes.float32, device=optim.params[0].device)
+    # for p in optim.params:
+    #   total_norm += p.grad.float().square().sum()
+    # total_norm = total_norm.sqrt().contiguous()
+    # clip_coef = opt_gradient_clip_norm / (total_norm + 1e-6)
+    # for p in optim.params:
+    #   p.grad = p.grad * Tensor.minimum(clip_coef, 1)
+
+    # optim.step()
+    # sched.step()
+
+    # lr = optim.lr
+    lr = Tensor([0.0], dtype=dtypes.float32)
+    loss.realize(lr)
+    return loss, lr, clip_coef
+
+  # Data
+  pq = pd.read_parquet("~/Downloads/mlperf_dataset/train-00000-of-00001.parquet")
+  it = itertools.batched(pq.itertuples(index=False, name=None), BS)
+
+  # Training loop
+  batch = next(it)
+  for i,_batch in enumerate(it):
+    if i % 16 == 0:
+      save_file_name = f"weights/lora/lora_{i}.safetensors"
+      save_file_state = {k:v for k,v in get_state_dict(model).items() if "lora" in k}
+      safe_save(save_file_state, save_file_name)
+      print(f"Saved {save_file_name}")
+    tokens = Tensor([b.tolist()[:SEQLEN] for b,_ in batch], dtype=dtypes.int32).contiguous().realize()
+    t = time.perf_counter()
+    GlobalCounters.reset()
+    loss, lr, clip_coef = train_step(model, tokens)
+    tqdm.write(f"{loss.item():.4f} loss, {lr.item():.12f} LR, {clip_coef.item():.12f} clip coef, {GlobalCounters.mem_used / 1e9:.2f} GB used, {time.perf_counter()-t:.2f} s")
 
 if __name__ == "__main__":
   multiprocessing.set_start_method('spawn')
