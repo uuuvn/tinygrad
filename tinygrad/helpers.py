@@ -32,6 +32,7 @@ def time_to_str(t:float, w=8) -> str: return next((f"{t * d:{w}.2f}{pr}" for d,p
 def ansistrip(s:str): return re.sub('\x1b\\[(K|.*?m)', '', s)
 def ansilen(s:str): return len(ansistrip(s))
 def make_tuple(x:int|Sequence[int], cnt:int) -> tuple[int, ...]: return (x,)*cnt if isinstance(x, int) else tuple(x)
+def lshl(l:list[T], i:int) -> list[T]: return l[i:] + l[:i] if len(l) > 0 and (i:=i%len(l)) else l[:]
 def flatten(l:Iterable[Iterable[T]]): return [item for sublist in l for item in sublist]
 def fully_flatten(l):
   if hasattr(l, "__len__") and hasattr(l, "__getitem__") and not isinstance(l, str):
