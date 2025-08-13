@@ -1,35 +1,23 @@
-from typing import cast
 import functools, itertools, operator
-from tinygrad.helpers import all_same, all_int, prod, DEBUG, RING, getenv, unwrap
+from tinygrad.helpers import all_same, all_int, prod, lshl, flatten, DEBUG, RING, getenv, unwrap
 from tinygrad.uop.ops import Ops, UOp, sint, PatternMatcher, UPat, GroupOp, resolve
 from tinygrad.device import Device
 
-# *** allreduce implementation ***
-def handle_allreduce_multirank(buf:UOp, red:UOp) -> UOp|None:
-  if not isinstance(buf.device, tuple): return None
+def chunk_disassemble(buf:UOp, n_chunks:int) -> list[UOp]:
+  factor = next((f for f in [32, 16, 8, 4, 2] if buf.shape[0] % f == 0), 1)
+  base, left = (buf.shape[0] // factor) // n_chunks, (buf.shape[0] // factor) % n_chunks
+  chunk_sizes = [(base + 1) * factor] * left + [base * factor] * (n_chunks - left)
+  return [buf.shrink((p,)) for p in itertools.pairwise(itertools.accumulate(chunk_sizes, initial=0))]
 
-  # Group buffers
-  groups: dict[int|None, list[UOp]] = {}
-  for i,dev in enumerate(buf.device):
-    groups.setdefault(Device[dev].group_id, []).append(buf.mselect(i))
+def chunk_assemble(chunks:list[UOp]) -> UOp:
+  pads = list(itertools.accumulate((chunk.shape[0] for chunk in chunks), initial=0))
+  return functools.reduce(operator.add, [c.pad(((p, pads[-1]-(p+c.shape[0])),)) for p,c in zip(pads, chunks)])
 
-  # Put reduce leader of each group first
-  reduce_leaders = set(getenv("REDUCE_LEADERS", "").split(","))
-  groups = {gid: sorted(bufs, key=lambda x: (x.device not in reduce_leaders, x.device)) for gid,bufs in groups.items()}
+def reduce_scatter(chunks:list[list[UOp]], alu:Ops) -> list[UOp]:
+  return [functools.reduce(lambda x,y: x.copy_to_device(y.device).alu(alu, y), lshl(devs, i+1)) for i,devs in enumerate(chunks)]
 
-  # Skip if only one group or if every group has only one buffer
-  if len(groups) <= 1 or not any(len(g) > 1 for g in groups.values()): return None
-
-  # Reduce inside each group
-  inner = [UOp(Ops.MSTACK, buf.dtype, tuple(bufs)).allreduce(red.arg, (cast(str, bufs[0].device),)).mselect(0) for bufs in groups.values()]
-
-  # Allreduce across groups
-  outer = UOp(Ops.MSTACK, buf.dtype, tuple(inner)).allreduce(red.arg, tuple(buf.device for buf in inner))
-
-  # Broadcast back to all devices in the group
-  gid2bid = {Device[device].group_id: i for i,device in enumerate(outer.device)}
-  return outer.mselect(gid2bid[Device[red.device].group_id]).copy_to_device(red.device) if not isinstance(red.device, tuple) else \
-         UOp(Ops.MSTACK, buf.dtype, tuple(outer.mselect(gid2bid[Device[device].group_id]).copy_to_device(device) for device in red.device))
+def all_gather(chunks:list[UOp]) -> list[list[UOp]]:
+  return [lshl(list(itertools.accumulate(lshl(chunks, i), lambda x,y: x.copy_to_device(y.device))), -i) for i in range(len(chunks))]
 
 def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   if not isinstance(buf.device, tuple): return None
@@ -44,40 +32,33 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   buf = buf.contiguous()
 
   # copy to all devices. if you shrink later, that'll be handled
-  if not use_ring: return functools.reduce(lambda x,y: x.alu(red.arg, y),
-                                           [UOp(Ops.COPY, buf.dtype, (buf.mselect(i), red.src[1])) for i in range(len(buf.device))])
+  if not use_ring: return functools.reduce(lambda x,y: x.alu(red.arg, y), [buf.copy_to_device(red.src[1], i) for i in range(len(buf.device))])
 
-  # new ring reduce
-  factor = next((f for f in [32, 16, 8, 4, 2] if numel % f == 0), 1)
-  base, left = (numel // factor) // n_lbs, (numel // factor) % n_lbs
-  chunk_sizes = [(base + 1) * factor] * left + [base * factor] * (n_lbs - left)
-  chunks = list(itertools.pairwise(itertools.accumulate(chunk_sizes, initial=0)))
+  # split into groups
+  g2ds: dict[int|None, list[int]] = {}
+  for i,dev in enumerate(buf.device):
+    g2ds.setdefault(Device[dev].group_id, []).append(i)
+  # can't do the fast path if groups are not even
+  if not all_same([len(i) for i in g2ds.values()]): g2ds = {None: flatten(g2ds.values())}
+  d2gi: dict[int, tuple[int|None, int]] = dict(sorted([(d, (g,i)) for g,ds in g2ds.items() for i,d in enumerate(ds)]))
 
-  # extract chunks and scatter-reduce
-  reduced_chunks = []
-  for i,(s,e) in enumerate(chunks):
-    chunk = buf.reshape((numel,)).shrink(((s,e),))
-    reduced_chunk = chunk
-    for step in range(n_lbs-1):
-      src, dest = (i+step)%n_lbs, (i+step+1)%n_lbs
-      # copy the chunk from the src device to the dest (operating device), and select the chunk on the dest device
-      reduced_chunk = reduced_chunk.copy_to_device(buf.device[dest], src if isinstance(reduced_chunk.device, tuple) else None) \
-        .alu(red.arg, chunk.copy_to_device(buf.device[dest], dest))
-    reduced_chunks.append(reduced_chunk)
+  # extract chunks
+  mchunks = chunk_disassemble(buf.reshape((numel,)), n_lbs // len(g2ds))
+  chunks = {g:[[chunk.mselect(d) for d in ds] for chunk in mchunks] for g,ds in g2ds.items()}
+
+  # scatter-reduce inside each group
+  reduced_chunks = {g:reduce_scatter(chunks, red.arg) for g,chunks in chunks.items()}
+
+  # allreduce scattered chunks across groups
+  reduced_chunks = {tg:[functools.reduce(lambda x,y: x.alu(red.arg, y), [reduced_chunks[g][i].copy_to_device(chunk.device) for g in g2ds])
+                       for i,chunk in enumerate(chunks)] for tg,chunks in reduced_chunks.items()}
 
   # allgather
-  copied_chunks = []
-  for i,c in enumerate(reduced_chunks):
-    this_chunk = [None] * len(buf.device)
-    this_chunk[(i+len(buf.device)-1)%n_lbs] = c
-    for step in range(n_lbs-1):
-      dest = (i+step)%n_lbs
-      this_chunk[dest] = c = c.copy_to_device(buf.device[dest])
-    copied_chunks.append(UOp(Ops.MSTACK, buf.dtype, tuple(cast(list[UOp], this_chunk))))
+  gathered = {g:all_gather(chunks) for g,chunks in reduced_chunks.items()}
 
   # reassemble
-  pads = [((s,numel-e),) for s,e in chunks]
-  return functools.reduce(operator.add, [c.pad(pad) for pad,c in zip(pads, copied_chunks)]).reshape(shape)
+  stacked = [UOp(Ops.MSTACK, buf.dtype, tuple(gathered[gid][cid][did] for gid,did in d2gi.values())) for cid in range(n_lbs // len(g2ds))]
+  return chunk_assemble(stacked).reshape(shape)
 
 # ***** multi rewrite MSELECT/MSTACK *****
 
@@ -110,7 +91,6 @@ def mstack_early_shrink(view:UOp, ms:UOp):
   return ms.replace(src=tuple(ret))
 
 replace_allreduce = PatternMatcher([
-  (UPat(Ops.ALLREDUCE, src=(UPat.var("buf"), UPat()), name="red"), handle_allreduce_multirank),
   (UPat(Ops.ALLREDUCE, src=(UPat.var("buf"), UPat()), name="red"), handle_allreduce),
   # BROADCAST: explicitly expand broadcast copies and combine with MSTACK
   (UPat(Ops.COPY, name="c", src=(UPat(GroupOp.All-{Ops.CONST}, name="x"), UPat(Ops.DEVICE))), lambda c,x:
