@@ -14,6 +14,11 @@ class objc_instance(objc_id): # method with name "new", "alloc" should be freed 
     # https://github.com/tinygrad/tinygrad/pull/8949 triggered the unlucky ordering which lead to a bunch of errors at exit
     # TODO: Why isn't `sys.is_finalizing` working?
     if msg is not None and libobjc is not None: msg("release")(self)
+  def __repr__(self): return from_ns_str(msg("description", objc_instance)(self))
+
+class MTLFunctionOptions:
+  MTLFunctionOptionCompileToBinary = 1 << 0
+  MTLFunctionOptionPipelineIndependent = 1 << 3
 
 class MTLResourceOptions:
   MTLResourceCPUCacheModeDefaultCache = 0
@@ -21,6 +26,7 @@ class MTLResourceOptions:
 
 class MTLPipelineOption:
   MTLPipelineOptionNone = 0
+  MTLPipelineOptionFailOnBinaryArchiveMiss = 1 << 2
 
 # 13 is requestType that metal uses to compile source code into MTLB, there aren't any docs or symbols.
 REQUEST_TYPE_COMPILE = 13
@@ -76,7 +82,7 @@ class MetalDevice(Compiled):
     from tinygrad.runtime.graph.metal import MetalGraph
     # NOTE: GitHub CI macOS runners use paravirtualized metal which is broken with graph.
     # This can be reproduced locally with any virtualization software (like utm) that can create macOS VMs with apple's own virtualization framework.
-    super().__init__(device, MetalAllocator(self), [(MetalRenderer, MetalCompiler), (MetalRenderer, Compiler)],
+    super().__init__(device, MetalAllocator(self), [(MetalRenderer, functools.partial(MetalCompiler, self)), (MetalRenderer, Compiler)],
                      functools.partial(MetalProgram, self), MetalGraph if 'virtual' not in from_ns_str(msg('name')(self.sysdevice)).lower() else None)
 
   def synchronize(self):
@@ -106,21 +112,24 @@ class MetalCompiler(Compiler):
   support = ctypes.CDLL("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler")
   support.MTLCodeGenServiceCreate.restype = ctypes.c_void_p
 
-  def __init__(self):
+  def __init__(self, dev:MetalDevice):
     self.cgs = ctypes.c_void_p(MetalCompiler.support.MTLCodeGenServiceCreate(b"tinygrad"))
-    super().__init__("compile_metal_direct")
+    self.sysdevice = dev.sysdevice
+    super().__init__("compile_metal_direct_pipeline_state")
   def __reduce__(self): return (MetalCompiler,()) # force pickle to create new instance for each multiprocessing fork
   def compile(self, src:str) -> bytes:
-    ret: Exception|bytes = CompileError("MTLCodeGenServiceBuildRequest returned without calling the callback")
+    print("--- SOURCE:")
+    print(src)
+    mtlb: Exception|bytes = CompileError("MTLCodeGenServiceBuildRequest returned without calling the callback")
     @ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p)
     def callback(blockptr, error, dataPtr, dataLen, errorMessage):
-      nonlocal ret
+      nonlocal mtlb
       if error == 0:
         reply = bytes(to_mv(dataPtr, dataLen))
         # offset from beginning to data = header size + warning size
-        ret = reply[sum(struct.unpack('<LL', reply[8:16])):]
+        mtlb = reply[sum(struct.unpack('<LL', reply[8:16])):]
       else:
-        ret = CompileError(errorMessage.decode())
+        mtlb = CompileError(errorMessage.decode())
 
     # no changes for compute in 2.0 - 2.4 specs, use 2.0 as default for old versions.
     macos_major = int(platform.mac_ver()[0].split('.')[0])
@@ -137,9 +146,35 @@ class MetalCompiler(Compiler):
     # Fields other than invoke are unused in this case so we can just use ctypes.byref with negative offset to invoke field, add blockptr as a first
     # argument and pretend it's a normal callback
     MetalCompiler.support.MTLCodeGenServiceBuildRequest(self.cgs, None, REQUEST_TYPE_COMPILE, request, len(request), ctypes.byref(callback, -0x10))
-    if isinstance(ret, Exception): raise ret
-    assert ret[:4] == b"MTLB" and ret[-4:] == b"ENDT", f"Invalid Metal library. {ret!r}"
-    return ret
+    if isinstance(mtlb, Exception): raise mtlb
+    assert mtlb[:4] == b"MTLB" and mtlb[-4:] == b"ENDT", f"Invalid Metal library. {mtlb!r}"
+    print("--- MTLB:")
+    print(mtlb)
+    print("--- CREATING BINARY ARCHIVE")
+    binary_archive_descriptor = msg("new", objc_instance)(libobjc.objc_getClass(b"MTLBinaryArchiveDescriptor"))
+    binary_archive  = msg("newBinaryArchiveWithDescriptor:error:", objc_instance)(self.sysdevice, binary_archive_descriptor,
+                                                                                  ctypes.byref(error_archive:=objc_instance()))
+    error_check(error_archive)
+    print("--- COMPLING WITH APPLE APIS")
+    mtlb_dispatch_data = libdispatch.dispatch_data_create(mtlb, len(mtlb), None, None)
+    library = msg("newLibraryWithData:error:", objc_instance)(self.sysdevice, mtlb_dispatch_data, ctypes.byref(error_lib:=objc_instance()))
+    error_check(error_lib)
+    fxn = msg("newFunctionWithName:", objc_instance)(library, to_ns_str(_name:="E_4"))
+    pipeline_descriptor = msg("new", objc_instance)(libobjc.objc_getClass(b"MTLComputePipelineDescriptor"))
+    msg("setComputeFunction:")(pipeline_descriptor, fxn)
+    msg("setSupportIndirectCommandBuffers:")(pipeline_descriptor, True)
+    msg("addComputePipelineFunctionsWithDescriptor:error:")(binary_archive, pipeline_descriptor, ctypes.byref(error_add:=objc_instance()))
+    error_check(error_add)
+    print("--- SERIALIZING")
+    with tempfile.NamedTemporaryFile(delete=True) as output_file:
+      file_url = msg("fileURLWithPath:", objc_instance)(libobjc.objc_getClass(b"NSURL"), to_ns_str(f"{output_file.name}"))
+      msg("serializeToURL:error:")(binary_archive, file_url, ctypes.byref(error_serialize:=objc_instance()))
+      error_check(error_serialize)
+      mtlpsbin = pathlib.Path(output_file.name).read_bytes()
+      print("--- MTLPSBIN:")
+      print(mtlpsbin)
+      print("--- END COMPILE")
+      return b"WRPR" + struct.pack("<II", len(mtlb), len(mtlpsbin)) + mtlb + mtlpsbin
   def disassemble(self, lib:bytes):
     with tempfile.NamedTemporaryFile(delete=True) as shader:
       shader.write(lib)
@@ -153,22 +188,40 @@ class MetalCompiler(Compiler):
 class MetalProgram:
   def __init__(self, dev:MetalDevice, name:str, lib:bytes):
     self.dev, self.name, self.lib = dev, name, lib
-    if lib[:4] == b"MTLB":
+    if lib[:4] == b"WRPR":
+      mtlb_len, mtlpsbin_len = struct.unpack("<II", lib[4:12])
+      mtlb, mtlpsbin = lib[12:12+mtlb_len], lib[12+mtlb_len:12+mtlb_len+mtlpsbin_len]
       # binary metal library
-      data = libdispatch.dispatch_data_create(lib, len(lib), None, None)
+      data = libdispatch.dispatch_data_create(mtlb, len(mtlb), None, None)
       self.library = msg("newLibraryWithData:error:", objc_instance)(self.dev.sysdevice, data, ctypes.byref(error_lib:=objc_instance()))
       error_check(error_lib)
+      with tempfile.NamedTemporaryFile(delete=True) as input_file:
+        pathlib.Path(input_file.name).write_bytes(mtlpsbin)
+        mtlpsbin_url = msg("fileURLWithPath:", objc_instance)(libobjc.objc_getClass(b"NSURL"), to_ns_str(f"{input_file.name}"))
+        binary_archive_descriptor = msg("new", objc_instance)(libobjc.objc_getClass(b"MTLBinaryArchiveDescriptor"))
+        msg("setUrl:")(binary_archive_descriptor, mtlpsbin_url)
+        self.binary_archive = msg("newBinaryArchiveWithDescriptor:error:", objc_instance)(self.dev.sysdevice, binary_archive_descriptor,
+                                                                                     ctypes.byref(error_archive:=objc_instance()))
+        error_check(error_archive)
     else:
       # metal source. rely on OS caching
       try: self.library = metal_src_to_library(self.dev, lib.decode())
       except CompileError as e: raise RuntimeError from e
+      self.binary_archive = None
     self.fxn = msg("newFunctionWithName:", objc_instance)(self.library, to_ns_str(name))
+    print('--- FUNCTION CREATED')
     descriptor = msg("new", objc_instance)(libobjc.objc_getClass(b"MTLComputePipelineDescriptor"))
     msg("setComputeFunction:")(descriptor, self.fxn)
     msg("setSupportIndirectCommandBuffers:")(descriptor, True)
+    pipeline_state_option = MTLPipelineOption.MTLPipelineOptionNone
+    if self.binary_archive is not None:
+      msg("setBinaryArchives:")(descriptor, msg("arrayWithObject:", objc_instance)(libobjc.objc_getClass(b"NSArray"), self.binary_archive))
+      pipeline_state_option = MTLPipelineOption.MTLPipelineOptionFailOnBinaryArchiveMiss
+    print('--- PIPELINE DESCRIPTOR CREATED')
     self.pipeline_state = msg("newComputePipelineStateWithDescriptor:options:reflection:error:", objc_instance)(self.dev.sysdevice,
-      descriptor, MTLPipelineOption.MTLPipelineOptionNone, None, ctypes.byref(error_pipeline_creation:=objc_instance()))
+      descriptor, pipeline_state_option, None, ctypes.byref(error_pipeline_creation:=objc_instance()))
     error_check(error_pipeline_creation)
+    print('--- PIPELINE STATE CREATED')
     # cache these msg calls
     self.max_total_threads: int = cast(int, msg("maxTotalThreadsPerThreadgroup", ctypes.c_ulong)(self.pipeline_state))
 

@@ -1,0 +1,3 @@
+command script import -c lldb_helper.py
+process launch
+quit
