@@ -40,8 +40,8 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   use_ring = (RING >= 2 or (n_lbs > 2 and numel > getenv("RING_ALLREDUCE_THRESHOLD", 256_000) and RING >= 1))
   if DEBUG >= 2: print(f"{'RING ALLREDUCE' if use_ring else 'NAIVE ALLREDUCE'} {n_lbs}x{numel} | {buf.dtype}")
 
-  # contiguous before we copy it
-  buf = buf.contiguous()
+  # FIXME: bug in multi
+  if buf.base.op is Ops.CONST: buf = buf.contiguous()
 
   # copy to all devices. if you shrink later, that'll be handled
   if not use_ring: return functools.reduce(lambda x,y: x.alu(red.arg, y),
