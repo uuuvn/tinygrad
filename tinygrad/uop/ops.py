@@ -849,6 +849,9 @@ def track_uop(u:UOp):
   arg = type(u.arg)(track_uop(u.arg.ast), u.arg.metadata) if u.op is Ops.KERNEL else u.arg
   uop_fields[num] = (u.op, u.dtype, tuple(track_uop(s) for s in u.src), arg, u.tag)+((u.metadata,) if TRACEMETA>=2 else ())
   return num
+def update_metadata(u:UOp):
+  num = track_uop(u)
+  uop_fields[num] = uop_fields[num][:5]+(u.metadata,)
 
 # *** tracking pattern matcher ***
 

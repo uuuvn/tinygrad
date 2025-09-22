@@ -124,6 +124,10 @@ def get_parameters(obj) -> list[Tensor]:
   """
   return list(get_state_dict(obj).values())
 
+def label_parameters(obj):
+  for k,v in get_state_dict(obj).items():
+    v.labels.append(k)
+
 def load_state_dict(model, state_dict:dict[str, Tensor], strict=True, verbose=True, consume=False, realize=True) -> list[Tensor]:
   """
   Loads a `state_dict` into a model. Return the loaded Tensors.
