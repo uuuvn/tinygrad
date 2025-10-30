@@ -51,33 +51,24 @@ def handle_allreduce(buf:UOp, red:UOp) -> UOp|None:
   factor = next((f for f in [32, 16, 8, 4, 2] if numel % f == 0), 1)
   base, left = (numel // factor) // n_lbs, (numel // factor) % n_lbs
   chunk_sizes = [(base + 1) * factor] * left + [base * factor] * (n_lbs - left)
-  chunks = list(itertools.pairwise(itertools.accumulate(chunk_sizes, initial=0)))
+  chunk_bounds = list(itertools.pairwise(itertools.accumulate(chunk_sizes, initial=0)))
+  chunks = [buf.reshape((numel,)).shrink(((s,e),)) for s,e in chunk_bounds]
 
-  # extract chunks and scatter-reduce
+  # reduce-scatter
   reduced_chunks = []
-  for i,(s,e) in enumerate(chunks):
-    chunk = buf.reshape((numel,)).shrink(((s,e),))
-    reduced_chunk = chunk
-    for step in range(n_lbs-1):
-      src, dest = (i+step)%n_lbs, (i+step+1)%n_lbs
-      # copy the chunk from the src device to the dest (operating device), and select the chunk on the dest device
-      reduced_chunk = reduced_chunk.copy_to_device(buf.device[dest], src if isinstance(reduced_chunk.device, tuple) else None) \
-        .alu(red.arg, chunk.copy_to_device(buf.device[dest], dest))
-    reduced_chunks.append(reduced_chunk)
+  for chunk_idx, multi_chunk in enumerate(chunks):
+    chunk_parts = [multi_chunk.mselect((chunk_idx + i + 1) % n_lbs) for i in range(n_lbs)]
+    reduced_chunks.append(functools.reduce(lambda x,y: x.copy_to_device(y.device).alu(red.arg, y), chunk_parts))
 
   # allgather
-  copied_chunks = []
-  for i,c in enumerate(reduced_chunks):
-    this_chunk: list[UOp|None] = [None] * len(buf.device)
-    this_chunk[(i+len(buf.device)-1)%n_lbs] = c
-    for step in range(n_lbs-1):
-      dest = (i+step)%n_lbs
-      this_chunk[dest] = c = c.copy_to_device(buf.device[dest])
-    copied_chunks.append(UOp(Ops.MSTACK, buf.dtype, tuple(cast(list[UOp], this_chunk))))
+  gathered_chunks = []
+  for chunk_idx, chunk in enumerate(reduced_chunks):
+    broadcasted = list(itertools.accumulate())
+    gathered_chunks.append(UOp(Ops.MSTACK, buf.dtype, tuple(broadcasted)))
 
   # reassemble
-  pads = [((s,numel-e),) for s,e in chunks]
-  return functools.reduce(operator.add, [c.pad(pad) for pad,c in zip(pads, copied_chunks)]).reshape(shape)
+  pads = [((s,numel-e),) for s,e in chunk_bounds]
+  return functools.reduce(operator.add, [c.pad(pad) for pad,c in zip(pads, gathered_chunks)]).reshape(shape)
 
 # ***** multi rewrite MSELECT/MSTACK *****
 
