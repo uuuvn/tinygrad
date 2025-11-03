@@ -2,6 +2,7 @@ import subprocess, pathlib, struct, ctypes, tempfile, functools, contextlib, dec
 from tinygrad.helpers import prod, to_mv, getenv, round_up, cache_dir, init_c_struct_t, PROFILE, ProfileRangeEvent, cpu_profile, unwrap
 import tinygrad.runtime.support.objc as objc
 from tinygrad.device import Compiled, Compiler, CompileError, LRUAllocator, ProfileDeviceEvent
+from tinygrad.runtime.support.block import blockify
 from tinygrad.renderer.cstyle import MetalRenderer
 from tinygrad.runtime.autogen import metal
 
@@ -79,7 +80,7 @@ class MetalCompiler(Compiler):
   def __reduce__(self): return (MetalCompiler,()) # force pickle to create new instance for each multiprocessing fork
   def compile(self, src:str) -> bytes:
     ret: Exception|bytes = CompileError("MTLCodeGenServiceBuildRequest returned without calling the callback")
-    @ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p)
+    @blockify(None, ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p)
     def callback(blockptr, error, dataPtr, dataLen, errorMessage):
       nonlocal ret
       if error == 0:
@@ -103,7 +104,7 @@ class MetalCompiler(Compiler):
     # See https://clang.llvm.org/docs/Block-ABI-Apple.html#high-level for struct layout.
     # Fields other than invoke are unused in this case so we can just use ctypes.byref with negative offset to invoke field, add blockptr as a first
     # argument and pretend it's a normal callback
-    MetalCompiler.support.MTLCodeGenServiceBuildRequest(self.cgs, None, REQUEST_TYPE_COMPILE, request, len(request), ctypes.byref(callback, -0x10))
+    MetalCompiler.support.MTLCodeGenServiceBuildRequest(self.cgs, None, REQUEST_TYPE_COMPILE, request, len(request), callback)
     if isinstance(ret, Exception): raise ret
     assert ret[:4] == b"MTLB" and ret[-4:] == b"ENDT", f"Invalid Metal library. {ret!r}"
     return ret
